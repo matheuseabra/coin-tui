@@ -131,6 +131,11 @@ Configuration comes from environment variables and CLI flags:
 
 Never log the key or include it in an error. Configure one reusable `reqwest::Client` with a user agent, connect timeout, total request timeout, gzip support, and rustls. Respect HTTP `429`; display a concise rate-limit state and delay automatic retries using `Retry-After` when present. Otherwise use capped exponential backoff with jitter for transient transport and `5xx` failures. Manual refresh does not bypass an active cooldown.
 
+### Refresh Scheduling
+
+A `RefreshScheduler` in `App` owns the only refresh cadence. A success marks `next_auto_at = now + interval` (default 60 seconds) and clears cooldown; a failure opens a cooldown window (`next_auto_at = now + delay`) during which neither the automatic tick nor a manual `r` may start a refresh. The delay is the exact `Retry-After` (floored at one second) when a `429` provides one, capped equal-jittered exponential backoff (`[scaled/2, scaled]`, `scaled = min(2s · 2^failures, 60s)`) for transient transport, timeout, `5xx`, and bare-`429` failures, and the steady 60-second gate for other errors. A manual refresh is allowed again as soon as the window passes; a success resets failures, cooldown, and the interval. The main loop emits a low-frequency `Tick` (one second, first tick delayed) that re-renders relative timestamps and lets the scheduler start automatic refreshes; the scheduler never starts a second fetch while one is in flight.
+
+
 Provider verification and fixture rules are defined in `TESTING.md`.
 
 ## Dependencies
@@ -159,7 +164,7 @@ Planned production dependencies are added only with the roadmap task that uses t
 | `color-eyre` | Error reports while preserving terminal cleanup. |
 | `tracing`, `tracing-subscriber` | Redacted diagnostics to a file. |
 
-Expected development dependencies are `wiremock` for HTTP-boundary tests and `tempfile` for isolated files. Add `insta`, `proptest`, Axum, or a database only when a roadmap task demonstrates a concrete need.
+Expected development dependencies are `wiremock` for HTTP-boundary tests and `tempfile` for isolated files. The `tokio` `test-util` feature (dev-only) enables paused-time tests for refresh scheduling. Add `insta`, `proptest`, Axum, or a database only when a roadmap task demonstrates a concrete need.
 
 Pin the Rust toolchain in `rust-toolchain.toml`. Let `Cargo.lock` pin crate versions for reproducible application builds; do not hard-code versions in this specification.
 

@@ -118,22 +118,25 @@ Goal: make a 100-row market list fast to inspect without a mouse.
   Depends on: `M3-01`.
   Acceptance: every visible numeric column sorts in both directions with deterministic ties.
   Evidence: `s` advances and `Shift-S` steps backward through a fixed 16-step cycle (rank, price, 1h, 24h, 7d, cap, volume, supply × ascending/descending) that wraps at the default rank order; sorting runs on the already-filtered visible set, missing values sort last in both directions, equal finite values keep snapshot order (stable `sort_by` with a non-`NaN`-leaking comparator), and selection re-anchors to the same coin id after reordering; the status line shows `sort: <key> ↑/↓` and drops it in the default rank order; 104 locked offline tests (74 unit + 30 provider) plus fmt, Clippy with denied warnings, and locked debug and release builds pass; a live 80x24 loopback run confirmed `sss` → `sort: price ↓` order (Bitcoin, Ethereum, Solana, Litecoin, Bitbo, Cardano), `Shift-S` → `price ↑`, two more `Shift-S` → `rank ↓` then back to default rank order with the indicator gone, and `q` restored the shell prompt. A latent M3-02 selection-retention bug (the anchor was captured after the query changed) was fixed by capturing the coin id before the visible set changes, with a new regression test.
-- [ ] `M3-04` Add a contextual help overlay.
+- [x] `M3-04` Add a contextual help overlay.
   Depends on: `M3-01`, `M3-02`, `M3-03`.
   Acceptance: help lists only implemented bindings, fits the minimum supported size, and closes with `?` or `Esc`.
-
+  Evidence: `?` toggles a centered bordered `Help` overlay (40 wide, 12 rows tall) that fits the 60x16 minimum (10 binding lines, each ≤ 38 columns, plus borders) and lists only implemented bindings – `q`/`Ctrl-C`, `j`/`Down`, `k`/`Up`, `g`/`Home`, `G`/`End`, `PageUp`/`Down`, `/` (search, `Enter`/`Esc`), `s`/`Shift-S`, `r`, and `?`/`Esc` to close; `?` or `Esc` closes it while `q`/`Ctrl-C` still quit, and every other key is swallowed so the overlay is modal and cannot leak shortcuts, search, sort, or refresh; `?` typed while search editing stays query text; the overlay draws over the live table and closes by restoring it; 5 new tests cover toggle/close, modality + quit, and search typing; 109 locked offline tests (79 unit + 30 provider) plus fmt, Clippy with denied warnings, and locked debug and release builds pass.
 Quality gate `G3`:
 
-- [ ] All M3 tasks are accepted and required checks pass.
-- [ ] A keyboard-only manual scenario can find Bitcoin, sort by 7-day change, return to rank order, refresh, and quit.
+- [x] All M3 tasks are accepted and required checks pass.
+  Evidence: `M3-01`, `M3-02`, `M3-03`, and `M3-04` are each accepted with their checks listed, and every M3 run above passes `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (109 locked offline tests: 79 unit + 30 provider), and locked debug plus release builds.
+- [x] A keyboard-only manual scenario can find Bitcoin, sort by 7-day change, return to rank order, refresh, and quit.
+  Evidence: a live 80x24 loopback run completed the whole path with the keyboard only – identify direction via the summary (`Mkt 24h: -0.65%`), open the `?` help overlay and list its bindings; `/bit Enter` narrowed to Bitcoin + Bitbo with `filter: bit (2)`; `Esc` cleared the filter back to all rows; nine `s` presses reached `sort: 7d ↓` ordered by 7-day change (Bitbo +9.90%, Ethereum +3.00%, Solana +1.40%, Cardano -0.50%, Bitcoin -1.20%, Litecoin -2.10%); seven more `s` wrapped to default rank order (Bitcoin #1 … Solana #6) with the sort indicator gone; `r` refreshed the snapshot to `LIVE | age 0s`; and `q` exited, restoring the shell prompt (`.bashrc` banner and prompt visible in the pane). Note: `tmux send-keys Esc` sends the literal text `Esc`; the real Escape key is `Escape` in the harness – the app handled every real keystroke correctly.
 
 ## M4: Operational Hardening
 
 Goal: behave predictably under real network, terminal, and provider failures.
 
-- [ ] `M4-01` Implement refresh scheduling, `Retry-After`, and capped jittered backoff.
+- [x] `M4-01` Implement refresh scheduling, `Retry-After`, and capped jittered backoff.
   Depends on: `G3`.
   Acceptance: paused-time Tokio tests cover success reset, cooldown, cap, and manual refresh during cooldown.
+  Evidence: `RefreshScheduler` in `src/app.rs` owns the cadence (60s default, min enforced), opening a cooldown on failure that blocks both the automatic tick and manual `r` until it passes; `failure_retry_delay` honors `Retry-After` exactly (floored at 1s) and applies capped equal-jittered exponential backoff (`[scaled/2, scaled]`, cap 60s) to transport, timeout, `5xx`, and bare-`429` failures. The run loop emits a low-frequency `Tick` (first tick delayed, then 1s) that re-renders freshness and starts due automatic refreshes. Paused-time tests named `success_resets_the_refresh_cadence` (interval fires at 60s and resets after success), `retry_after_opens_a_cooldown_that_blocks_manual_refresh` (30s window: manual `r` blocked at 10s, auto retry after 30s only), `backoff_window_is_capped_after_repeated_failures` (windows never exceed 60s, floor reached), `jittered_backoff_stays_within_its_scaled_window`, `failure_retry_delay_honors_retry_after_and_classifies_errors`, and `tick_drives_an_automatic_refresh_through_the_loop` (exactly one initial fetch, a second fetch after the interval) cover the acceptance. UI shows a cooldown countdown (`Retrying automatically in Ns`) instead of `Press r to retry` in Stale and Fatal states. `tokio` gained the dev-only `test-util` feature (see `docs/ARCHITECTURE.md`). Gates after implementation: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (85 unit + 30 provider), and `cargo build --locked` all pass.
 - [ ] `M4-02` Add bounded response handling, remote-text sanitization, and redacted file tracing.
   Depends on: `G3`.
   Acceptance: oversized, control-character, and secret-bearing fixtures cannot corrupt the terminal or leak the key.

@@ -22,6 +22,22 @@ use crate::{
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 16;
 
+/// Help overlay width and content. Every line must fit the inner width (width
+/// minus borders) and the whole block must fit the minimum supported height.
+const HELP_WIDTH: u16 = 40;
+const HELP_LINES: &[&str] = &[
+    "q / Ctrl-C      Quit",
+    "j / Down        Next coin",
+    "k / Up          Previous coin",
+    "g / Home        First coin",
+    "G / End         Last coin",
+    "PageUp/Down     Move one page",
+    "/               Search (Enter/Esc)",
+    "s / Shift-S     Cycle sort column",
+    "r               Refresh",
+    "? / Esc         Close help",
+];
+
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -52,6 +68,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Paragraph::new(status_line(app, frame.area().width)),
         areas[2],
     );
+    if app.help_open() {
+        render_help(frame, area);
+    }
 }
 
 fn render_resize_message(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
@@ -64,6 +83,29 @@ fn render_resize_message(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().fg(Color::Yellow)),
         inner,
+    );
+}
+
+fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+    let height = (HELP_LINES.len() as u16) + 2;
+    let left = area.x + area.width.saturating_sub(HELP_WIDTH) / 2;
+    let top = area.y + area.height.saturating_sub(height) / 2;
+    let outer = ratatui::layout::Rect::new(
+        left,
+        top,
+        HELP_WIDTH.min(area.width),
+        height.min(area.height),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help ")
+        .style(Style::default().fg(Color::Yellow));
+    let lines: Vec<Line<'static>> = HELP_LINES.iter().map(|line| Line::from(*line)).collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().fg(Color::Yellow))
+            .block(block),
+        outer,
     );
 }
 
@@ -87,9 +129,14 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
                 .iter()
                 .map(|error| Line::from(summary_message(error)))
                 .collect();
-            info.push(Line::from(format!(
-                "Refresh failed: {reason}. Press r to retry."
-            )));
+            let retry = match app.refresh_cooldown() {
+                Some(remaining) => format!(
+                    "Refresh failed: {reason}. Retrying automatically in {}s.",
+                    remaining.as_secs().max(1)
+                ),
+                None => format!("Refresh failed: {reason}. Press r to retry."),
+            };
+            info.push(Line::from(retry));
             table_frame("Market | Stale", app, info, frame, area, width);
         }
         DataState::Empty { notice, .. } => {
@@ -109,6 +156,11 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
             let mut body = vec![Line::from(fatal_message(error))];
             if app.fetching() {
                 body.push(Line::from("Refreshing market data..."));
+            } else if let Some(remaining) = app.refresh_cooldown() {
+                body.push(Line::from(format!(
+                    "Retrying automatically in {}s.",
+                    remaining.as_secs().max(1)
+                )));
             }
             message_lines("Market | Error", body, frame, area);
         }
@@ -1084,13 +1136,15 @@ mod tests {
             }),
         });
         assert!(text_at(&stale, 80, 24).contains("RATE LIMITED"));
-        let _ = stale.update(Event::Input(KeyEvent::new(
-            KeyCode::Char('r'),
-            KeyModifiers::NONE,
-        )));
-        let retrying = text_at(&stale, 80, 24);
-        assert!(retrying.contains("REFRESHING") && retrying.contains("cached RATE LIMITED"));
-        assert!(retrying.contains("Summary unavailable"));
+        let cooling = text_at(&stale, 80, 24);
+        assert!(
+            cooling.contains("Retrying automatically in"),
+            "cooldown countdown shown in the stale body: {cooling:?}"
+        );
+        assert!(
+            !cooling.contains("REFRESHING"),
+            "r is blocked by the cooldown, so no refresh starts: {cooling:?}"
+        );
 
         let offline = app_with(Err(ApiError::Transport));
         assert!(text_at(&offline, 80, 24).contains("OFFLINE"));
@@ -1402,7 +1456,7 @@ mod tests {
         let rendered = text_at(&app, 60, 16);
         assert!(rendered.contains("Refresh failed"), "reason line visible");
         assert!(
-            rendered.contains("retry"),
+            rendered.contains("Retrying"),
             "retry action wraps onto a visible line: {rendered:?}"
         );
     }
@@ -1535,8 +1589,8 @@ mod tests {
         });
         let rendered = text_at(&app, 60, 16);
         assert!(
-            rendered.contains("Summary unavailable") && rendered.contains("retry"),
-            "notice and retry hint both visible at 60x16"
+            rendered.contains("Summary unavailable") && rendered.contains("Retrying"),
+            "notice and retry hint both visible at 60x16: {rendered:?}"
         );
     }
 
@@ -1743,8 +1797,8 @@ mod tests {
         assert_eq!(summary_line(&fatal, 60), "Cap:- Vol24:- BTCdom:- Mkt24:-");
     }
 
-    #[test]
-    fn status_line_drop_order_keeps_state_and_drops_marker_then_age() {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn status_line_drop_order_keeps_state_and_drops_marker_then_age() {
         let mut app = app_with(Ok(crate::api::FetchOutcome {
             snapshot: summary_snapshot(),
             summary_notice: Some(ApiError::RateLimited { retry_after: None }),
@@ -1765,6 +1819,19 @@ mod tests {
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         )));
+        let cooling = status_line(&app, 80);
+        assert!(
+            cooling.contains("RATE LIMITED") && !cooling.contains("cached"),
+            "r blocked by the cooldown leaves the state detail unfetched: {cooling}"
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert!(matches!(
+            app.update(Event::Input(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+            ))),
+            Command::Fetch { .. }
+        ));
         let line = status_line(&app, 60);
         assert!(line.contains("cached RATE LIMITED"), "{line}");
         assert!(
@@ -1833,7 +1900,15 @@ mod tests {
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         )));
-        assert!(text_at(&fatal, 80, 24).contains("Refreshing market data"));
+        let cooling = text_at(&fatal, 80, 24);
+        assert!(
+            cooling.contains("Retrying automatically in"),
+            "cooldown countdown instead of a blocked manual refresh: {cooling:?}"
+        );
+        assert!(
+            !cooling.contains("Refreshing market data"),
+            "r is blocked while the cooldown is open: {cooling:?}"
+        );
     }
 
     #[test]
@@ -2210,6 +2285,88 @@ mod tests {
             position_of("Litecoin") < position_of("Bitcoin")
                 && position_of("Bitcoin") < position_of("Bitbo"),
             "rows render in descending price order: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn help_overlay_renders_bindings_and_fits_minimum_size() {
+        let mut app = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(vec![row_input("bitcoin", 1, "Bitcoin", "BTC", 1.0)]),
+            summary_notice: None,
+        }));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.help_open());
+        let help = text_at(&app, 60, 16);
+        for expected in [
+            " Help ",
+            "Quit",
+            "Next coin",
+            "Previous coin",
+            "First coin",
+            "Last coin",
+            "Move one page",
+            "Search (Enter/Esc)",
+            "Cycle sort column",
+            "Refresh",
+            "Close help",
+        ] {
+            assert!(help.contains(expected), "help lists {expected}: {help:?}");
+        }
+        for line in HELP_LINES {
+            assert!(
+                line.chars().count() <= (HELP_WIDTH as usize) - 2,
+                "help line {line:?} fits the overlay inner width"
+            );
+        }
+        assert!(
+            (HELP_LINES.len() as u16) + 2 <= 16,
+            "help block fits the minimum height"
+        );
+    }
+
+    #[test]
+    fn help_overlay_closes_with_esc_and_question_and_restores_the_table() {
+        let mut app = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(vec![
+                row_input("bitcoin", 1, "Bitcoin", "BTC", 1.0),
+                row_input("bitbo", 2, "Bitbo", "BBO", 1.0),
+            ]),
+            summary_notice: None,
+        }));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(text_at(&app, 60, 16).contains("Close help"));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.help_open());
+        let after_esc = text_at(&app, 60, 16);
+        assert!(
+            !after_esc.contains("Close help"),
+            "Esc dismisses the overlay: {after_esc:?}"
+        );
+        assert!(
+            after_esc.contains("BTC"),
+            "compact table renders again after Esc: {after_esc:?}"
+        );
+
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            !text_at(&app, 60, 16).contains("Close help"),
+            "? toggles the overlay closed"
         );
     }
 }

@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, io, sync::Arc, time::Instant};
+use std::{
+    cmp::Ordering,
+    io,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{
     Event as CrosstermEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
@@ -15,6 +20,7 @@ use crate::{
 
 pub enum Event {
     Start,
+    Tick,
     Input(KeyEvent),
     Resize {
         height: u16,
@@ -63,6 +69,8 @@ pub struct App {
     viewport_rows: usize,
     search: SearchState,
     sort: SortState,
+    help_open: bool,
+    schedule: RefreshScheduler,
 }
 
 /// Editing and committed state for the `/` search feature. Typing fills
@@ -168,6 +176,109 @@ impl SortState {
 /// Cap the search buffer so a long typed query cannot overflow the layout.
 const MAX_SEARCH_CHARS: usize = 64;
 
+/// Default automatic refresh cadence. The eventual CLI flag (`--refresh-seconds`)
+/// will override it; the architecture floor is 15 seconds.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Capped jittered backoff base and ceiling for transient failures.
+const BACKOFF_BASE_MS: u64 = 2_000;
+const BACKOFF_MAX_MS: u64 = 60_000;
+/// Cooldown applied to non-transient failures (4xx, malformed responses) so
+/// automatic retries stay on a steady cadence without hammering the provider.
+const RETRY_GATE: Duration = Duration::from_secs(60);
+
+/// When the next refresh attempt is allowed. A success restarts the normal
+/// cadence (`next_auto_at = now + interval`); a failure opens a cooldown window
+/// during which neither automatic nor manual refresh may start.
+struct RefreshScheduler {
+    interval: Duration,
+    failures: u32,
+    next_auto_at: tokio::time::Instant,
+    cooling_down: bool,
+}
+
+impl RefreshScheduler {
+    fn new(now: tokio::time::Instant, interval: Duration) -> Self {
+        Self {
+            interval,
+            failures: 0,
+            next_auto_at: now + interval,
+            cooling_down: false,
+        }
+    }
+    /// A manual refresh may start unless a failure cooldown is still active.
+    fn allow_manual(&self, now: tokio::time::Instant) -> bool {
+        !self.cooling_down || now >= self.next_auto_at
+    }
+    /// An automatic refresh may start once the current window has elapsed.
+    fn due(&self, now: tokio::time::Instant, fetching: bool) -> bool {
+        !fetching && now >= self.next_auto_at
+    }
+    fn mark_success(&mut self, now: tokio::time::Instant) {
+        self.failures = 0;
+        self.cooling_down = false;
+        self.next_auto_at = now + self.interval;
+    }
+    fn mark_failure(&mut self, now: tokio::time::Instant, delay: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        self.cooling_down = true;
+        self.next_auto_at = now + delay;
+    }
+    /// Remaining cooldown window, if one is still open.
+    fn cooldown_remaining(&self, now: tokio::time::Instant) -> Option<Duration> {
+        if self.cooling_down {
+            let remaining = self.next_auto_at.saturating_duration_since(now);
+            if !remaining.is_zero() {
+                return Some(remaining);
+            }
+        }
+        None
+    }
+}
+
+/// How long to wait before the next attempt after a failed refresh. A `429`
+/// honors the provider's `Retry-After` (floored at one second); transient
+/// failures (transport, timeout, `5xx`, or a bare `429`) use capped jittered
+/// backoff; other errors retry on the steady cadence.
+fn failure_retry_delay(error: &ApiError, failures: u32) -> Duration {
+    match error {
+        ApiError::RateLimited {
+            retry_after: Some(delay),
+        } => (*delay).max(Duration::from_secs(1)),
+        ApiError::Timeout | ApiError::Transport => jittered_backoff(failures),
+        ApiError::HttpStatus { status } if (500..600).contains(status) => {
+            jittered_backoff(failures)
+        }
+        ApiError::RateLimited { retry_after: None } => jittered_backoff(failures),
+        _ => RETRY_GATE,
+    }
+}
+
+/// Capped exponential backoff with equal jitter: the delay lands in
+/// `[scaled / 2, scaled]` where `scaled` grows by a factor of two per failure
+/// up to `BACKOFF_MAX_MS`.
+fn jittered_backoff(failures: u32) -> Duration {
+    let scaled = BACKOFF_BASE_MS
+        .saturating_mul(1_u64 << failures.min(60))
+        .min(BACKOFF_MAX_MS);
+    let lower = scaled / 2;
+    let range = (scaled - lower).max(1);
+    Duration::from_millis(lower + pseudo_random(u64::from(failures)) % range)
+}
+
+/// Cheap deterministic-mix jitter seed. Time only varies the shift; the bounds
+/// come from the deterministic backoff window.
+fn pseudo_random(seed: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut value = now ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    value
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -178,6 +289,8 @@ impl App {
             viewport_rows: 16,
             search: SearchState::default(),
             sort: SortState::default(),
+            help_open: false,
+            schedule: RefreshScheduler::new(tokio::time::Instant::now(), REFRESH_INTERVAL),
         }
     }
 
@@ -185,7 +298,23 @@ impl App {
     pub fn update(&mut self, event: Event) -> Command {
         match event {
             Event::Start => self.request_refresh(),
+            Event::Tick => {
+                let now = tokio::time::Instant::now();
+                if self.schedule.due(now, self.fetching) {
+                    self.begin_fetch()
+                } else {
+                    Command::Render
+                }
+            }
             Event::Input(key) if should_quit(key, self.search.typing) => Command::Quit,
+            Event::Input(key) if self.help_open => {
+                if is_help_toggle(key) || is_esc(key) {
+                    self.help_open = false;
+                    Command::Render
+                } else {
+                    Command::None
+                }
+            }
             Event::Input(key) if self.search.typing => {
                 if self.search_input(key) {
                     Command::Render
@@ -200,6 +329,10 @@ impl App {
             Event::Input(key) if is_search_start(key) => {
                 self.search.typing = true;
                 self.search.buffer.clear();
+                Command::Render
+            }
+            Event::Input(key) if is_help_toggle(key) => {
+                self.help_open = true;
                 Command::Render
             }
             Event::Input(key) if is_sort_forward(key) => {
@@ -225,44 +358,55 @@ impl App {
                 }
                 self.fetching = false;
                 let refreshed_at = Instant::now();
-                self.state = match result {
-                    Ok(outcome) if outcome.snapshot.coins().is_empty() => DataState::Empty {
-                        snapshot: outcome.snapshot,
-                        refreshed_at,
-                        notice: outcome.summary_notice,
-                    },
-                    Ok(outcome) => DataState::Ready {
-                        snapshot: outcome.snapshot,
-                        refreshed_at,
-                        notice: outcome.summary_notice,
-                    },
-                    Err(error) => match self.state.clone() {
-                        DataState::Ready {
-                            snapshot,
-                            refreshed_at,
-                            notice,
+                let scheduler_now = tokio::time::Instant::now();
+                match result {
+                    Ok(outcome) => {
+                        self.schedule.mark_success(scheduler_now);
+                        if outcome.snapshot.coins().is_empty() {
+                            self.state = DataState::Empty {
+                                snapshot: outcome.snapshot,
+                                refreshed_at,
+                                notice: outcome.summary_notice,
+                            };
+                        } else {
+                            self.state = DataState::Ready {
+                                snapshot: outcome.snapshot,
+                                refreshed_at,
+                                notice: outcome.summary_notice,
+                            };
                         }
-                        | DataState::Empty {
-                            snapshot,
-                            refreshed_at,
-                            notice,
-                        }
-                        | DataState::Stale {
-                            snapshot,
-                            refreshed_at,
-                            notice,
-                            ..
-                        } => DataState::Stale {
-                            snapshot,
-                            refreshed_at,
-                            error,
-                            notice,
-                        },
-                        DataState::Initial | DataState::Loading | DataState::Fatal(_) => {
-                            DataState::Fatal(error)
-                        }
-                    },
-                };
+                    }
+                    Err(error) => {
+                        let delay = failure_retry_delay(&error, self.schedule.failures);
+                        self.schedule.mark_failure(scheduler_now, delay);
+                        self.state = match self.state.clone() {
+                            DataState::Ready {
+                                snapshot,
+                                refreshed_at,
+                                notice,
+                            }
+                            | DataState::Empty {
+                                snapshot,
+                                refreshed_at,
+                                notice,
+                            }
+                            | DataState::Stale {
+                                snapshot,
+                                refreshed_at,
+                                notice,
+                                ..
+                            } => DataState::Stale {
+                                snapshot,
+                                refreshed_at,
+                                error,
+                                notice,
+                            },
+                            DataState::Initial | DataState::Loading | DataState::Fatal(_) => {
+                                DataState::Fatal(error)
+                            }
+                        };
+                    }
+                }
                 self.clamp_selection();
                 Command::Render
             }
@@ -291,10 +435,19 @@ impl App {
         };
     }
 
+    /// Manual refresh. It starts a fetch unless one is active or a failure
+    /// cooldown is still open (manual refresh never bypasses a cooldown).
     fn request_refresh(&mut self) -> Command {
         if self.fetching {
             return Command::None;
         }
+        if !self.schedule.allow_manual(tokio::time::Instant::now()) {
+            return Command::None;
+        }
+        self.begin_fetch()
+    }
+
+    fn begin_fetch(&mut self) -> Command {
         self.generation = self.generation.wrapping_add(1);
         self.fetching = true;
         if matches!(self.state, DataState::Initial) {
@@ -379,6 +532,15 @@ impl App {
     /// True when the active sort differs from the natural rank order.
     pub fn sort_active(&self) -> bool {
         self.sort != SortState::default()
+    }
+    pub fn help_open(&self) -> bool {
+        self.help_open
+    }
+    /// Remaining failure cooldown window, if one is open. UI uses it to
+    /// replace the "press r to retry" call-to-action with a countdown.
+    pub fn refresh_cooldown(&self) -> Option<Duration> {
+        self.schedule
+            .cooldown_remaining(tokio::time::Instant::now())
     }
     /// Move the sort key (and its direction) one step forward or backward in
     /// the cycle and keep the selection on the same coin id.
@@ -586,6 +748,13 @@ where
     let loop_result = async {
         controller.start_initial_refresh();
         render(&controller.app)?;
+        // Low-frequency tick: refreshes relative timestamps, re-renders, and
+        // lets the refresh scheduler start automatic refreshes. The first
+        // tick is delayed so startup is not double-rendered.
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
         loop {
             let event = tokio::select! {
                 event = input.next() => match event {
@@ -599,6 +768,7 @@ where
                     Some(event) => event,
                     None => return Ok(()),
                 },
+                _ = ticker.tick() => Event::Tick,
             };
             match controller.handle(event).await {
                 Command::Quit => {
@@ -633,6 +803,18 @@ fn should_quit(key: KeyEvent, typing: bool) -> bool {
 
 fn is_search_start(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Char('/') && key.modifiers.is_empty()
+}
+
+/// `?` toggles the help overlay. Some terminals report the shifted char with
+/// the SHIFT modifier and some without, so both spellings are accepted.
+fn is_help_toggle(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('?')
+        && (key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
+fn is_esc(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Esc && key.modifiers.is_empty()
 }
 
 /// `s` advances the sort cycle; `Shift-S` moves backward. Terminals report the
@@ -807,6 +989,21 @@ mod tests {
                 first_polled: Arc::clone(&self.first_polled),
                 polled: false,
             })
+        }
+    }
+
+    /// A provider that counts calls and completes each fetch with an empty
+    /// snapshot, used to observe automatic refreshes through the run loop.
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MarketData for CountingProvider {
+        fn fetch_snapshot<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchOutcome, ApiError>> + Send + 'a>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(outcome(snapshot())) })
         }
     }
 
@@ -1232,8 +1429,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn summary_notice_keeps_rows_and_clears_on_next_clean_success() {
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn summary_notice_keeps_rows_and_clears_on_next_clean_success() {
         let mut app = App::new();
         let Command::Fetch { generation } = app.update(Event::Start) else {
             panic!()
@@ -1274,15 +1471,28 @@ mod tests {
                 ..
             } if delay == Duration::from_secs(7)
         ));
+        assert!(
+            app.refresh_cooldown().is_some(),
+            "transport failure opens a cooldown"
+        );
+        assert!(
+            matches!(app.update(Event::Input(key('r'))), Command::None),
+            "manual refresh is blocked while the cooldown is open"
+        );
 
+        tokio::time::advance(Duration::from_secs(3)).await;
         let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
-            panic!()
+            panic!("a manual refresh is allowed once the cooldown passes")
         };
         app.update(Event::FetchResult {
             generation,
             result: Ok(outcome(snapshot())),
         });
         assert!(matches!(app.state(), DataState::Ready { notice: None, .. }));
+        assert!(
+            app.refresh_cooldown().is_none(),
+            "success clears the cooldown"
+        );
     }
 
     #[test]
@@ -1320,6 +1530,203 @@ mod tests {
             DataState::Stale { snapshot, refreshed_at: same_time, .. }
                 if snapshot == empty && same_time == refreshed_at
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn success_resets_the_refresh_cadence() {
+        let mut app = App::new();
+        let Command::Fetch { generation } = app.update(Event::Start) else {
+            panic!()
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(snapshot())),
+        });
+        assert!(app.refresh_cooldown().is_none());
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(
+            is_render(app.update(Event::Tick)),
+            "no automatic refresh before the interval elapses"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let Command::Fetch { generation } = app.update(Event::Tick) else {
+            panic!("automatic refresh fires once the interval elapses")
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(snapshot())),
+        });
+
+        tokio::time::advance(Duration::from_secs(59)).await;
+        assert!(
+            is_render(app.update(Event::Tick)),
+            "a success resets the cadence to a full interval"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            matches!(app.update(Event::Tick), Command::Fetch { .. }),
+            "the reset cadence fires again on schedule"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retry_after_opens_a_cooldown_that_blocks_manual_refresh() {
+        let mut app = App::new();
+        let Command::Fetch { generation } = app.update(Event::Start) else {
+            panic!()
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Err(ApiError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            }),
+        });
+        assert_eq!(
+            app.refresh_cooldown(),
+            Some(Duration::from_secs(30)),
+            "Retry-After opens an exact cooldown window"
+        );
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(
+            matches!(app.update(Event::Input(key('r'))), Command::None),
+            "manual refresh is blocked while the cooldown is open"
+        );
+        tokio::time::advance(Duration::from_secs(19)).await;
+        assert!(
+            is_render(app.update(Event::Tick)),
+            "no automatic retry before Retry-After elapses"
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            matches!(app.update(Event::Tick), Command::Fetch { .. }),
+            "the automatic retry fires after the Retry-After window"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn backoff_window_is_capped_after_repeated_failures() {
+        let mut app = App::new();
+        let Command::Fetch { generation } = app.update(Event::Start) else {
+            panic!()
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Err(ApiError::Transport),
+        });
+        let first = app.refresh_cooldown().expect("failure opens a cooldown");
+        assert!(
+            first >= Duration::from_secs(1) && first <= Duration::from_secs(2),
+            "first backoff sits in the base window: {first:?}"
+        );
+
+        for failure in 0..10 {
+            let remaining = app.refresh_cooldown().expect("still cooling down");
+            tokio::time::advance(remaining + Duration::from_millis(1)).await;
+            let Command::Fetch { generation } = app.update(Event::Tick) else {
+                panic!("automatic retry fires after the cooldown window")
+            };
+            app.update(Event::FetchResult {
+                generation,
+                result: Err(ApiError::Transport),
+            });
+            let next = app.refresh_cooldown().unwrap();
+            assert!(
+                next <= Duration::from_secs(60),
+                "the backoff window never exceeds the cap: {next:?}"
+            );
+            if failure >= 5 {
+                assert!(
+                    next >= Duration::from_secs(30),
+                    "a deeply-exponentiated window sits at the cap floor: {next:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_stays_within_its_scaled_window() {
+        for failures in 0..20 {
+            for _ in 0..64 {
+                let delay = jittered_backoff(failures);
+                let scaled = BACKOFF_BASE_MS
+                    .saturating_mul(1_u64 << failures.min(60))
+                    .min(BACKOFF_MAX_MS);
+                let milliseconds = delay.as_millis() as u64;
+                let lower = scaled / 2;
+                assert!(
+                    (lower..=scaled).contains(&milliseconds),
+                    "failures={failures} delay {delay:?} outside [{lower}, {scaled}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failure_retry_delay_honors_retry_after_and_classifies_errors() {
+        assert_eq!(
+            failure_retry_delay(
+                &ApiError::RateLimited {
+                    retry_after: Some(Duration::from_secs(42)),
+                },
+                7,
+            ),
+            Duration::from_secs(42),
+            "Retry-After is honored exactly"
+        );
+        assert_eq!(
+            failure_retry_delay(
+                &ApiError::RateLimited {
+                    retry_after: Some(Duration::ZERO),
+                },
+                0,
+            ),
+            Duration::from_secs(1),
+            "a zero Retry-After is floored to one second"
+        );
+        let transport = failure_retry_delay(&ApiError::Transport, 0);
+        assert!(
+            transport >= Duration::from_secs(1) && transport <= Duration::from_secs(2),
+            "transport backoff stays in the base window: {transport:?}"
+        );
+        assert!(
+            failure_retry_delay(&ApiError::HttpStatus { status: 503 }, 20)
+                <= Duration::from_secs(60),
+            "a 5xx failure uses capped backoff"
+        );
+        assert_eq!(
+            failure_retry_delay(&ApiError::HttpStatus { status: 400 }, 0),
+            RETRY_GATE,
+            "a client error retries on the steady gate"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn tick_drives_an_automatic_refresh_through_the_loop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn(run_loop_with_sources(
+            Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            }),
+            stream::pending::<Result<CrosstermEvent, io::Error>>(),
+            |_| Ok(()),
+        ));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "only the initial refresh runs before the interval elapses"
+        );
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "the low-frequency tick started an automatic refresh"
+        );
+        task.abort();
+        task.await.unwrap_err();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1929,5 +2336,55 @@ mod tests {
             "bitbo",
             "the anchored coin is not replaced by the coin that fills its old index"
         );
+    }
+
+    #[test]
+    fn help_toggles_with_question_mark_and_closes_with_question_or_esc() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        assert!(!app.help_open());
+        assert!(is_render(app.update(Event::Input(key('?')))));
+        assert!(app.help_open());
+        assert!(is_render(app.update(Event::Input(key('?')))));
+        assert!(!app.help_open(), "second ? closes help");
+
+        assert!(is_render(app.update(Event::Input(key('?')))));
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(is_render(app.update(Event::Input(esc))));
+        assert!(!app.help_open(), "Esc closes help");
+
+        let shift_question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        assert!(is_render(app.update(Event::Input(shift_question))));
+        assert!(app.help_open(), "shifted ? also opens help");
+    }
+
+    #[test]
+    fn help_is_modal_blocks_shortcuts_and_keeps_quit() {
+        let mut app = ready_app(5);
+        app.update(Event::Input(key('?')));
+        assert!(app.help_open());
+        let selected = app.selected();
+        for route in ['j', 's', 'S', 'r', '/', 'g', 'G', 'k'] {
+            let command = app.update(Event::Input(key(route)));
+            assert!(
+                matches!(command, Command::None),
+                "{route} is swallowed while help is open"
+            );
+        }
+        assert!(app.help_open());
+        assert_eq!(app.selected(), selected, "navigation is blocked");
+        assert!(!app.sort_active(), "sort is blocked");
+        assert!(!app.fetching(), "refresh is blocked");
+        assert!(!app.searching(), "search is blocked");
+
+        let quit = app.update(Event::Input(key('q')));
+        assert!(matches!(quit, Command::Quit), "q still quits over help");
+    }
+
+    #[test]
+    fn question_mark_is_query_text_while_searching() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        type_query(&mut app, "btc?eth");
+        assert_eq!(app.search_buffer(), "btc?eth");
+        assert!(!app.help_open(), "? while typing never opens help");
     }
 }

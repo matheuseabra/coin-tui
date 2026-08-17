@@ -96,7 +96,9 @@ Search is case-insensitive over coin name and symbol. Sorting is stable, missing
 | Offline | Explain whether stale data remains available and offer refresh when allowed. |
 | Fatal | Explain why no usable data is available and keep quit and help active. |
 
-Messages state impact and one action. Example: `Offline: showing data from 4m ago; press r to retry`.
+Messages state impact and one action. Example: `Offline: showing data from 4m ago; press r to retry`. During a refresh cooldown the message replaces the retry call-to-action with a countdown, for example `Refresh failed: rate limited. Retrying automatically in 23s.`
+
+Market data refreshes automatically every 60 seconds while the connection is healthy. After a failure the app waits out the provider's `Retry-After` window (rate limited) or a capped jittered backoff, shows the countdown, and blocks both automatic and manual refresh until it passes.
 
 ## Product Quality
 
