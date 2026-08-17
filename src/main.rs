@@ -1,5 +1,6 @@
 mod api;
 mod app;
+mod config;
 mod domain;
 mod format;
 mod log;
@@ -8,5 +9,12 @@ mod ui;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
-    app::run().await
+    let config = match config::load() {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("coin-tui: {message}");
+            std::process::exit(2);
+        }
+    };
+    app::run(config).await
 }

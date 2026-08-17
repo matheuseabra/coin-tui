@@ -5,8 +5,7 @@ A read-only cryptocurrency market dashboard for the terminal, built with Rust, R
 ## Run
 
 ```sh
-cargo run --locked
-```
+c```
 
 Coin TUI uses CoinGecko's Demo API over HTTPS. Set `COIN_TUI_API_KEY` when the endpoint requires a demo key. `COIN_TUI_BASE_URL` overrides the endpoint for local loopback mocks or compatible HTTPS hosts.
 

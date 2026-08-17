@@ -160,12 +160,12 @@ Current production dependencies:
 | `httpdate` | HTTP-date form of provider `Retry-After` headers. |
 | `url` | Parsed host validation for HTTPS and loopback-only HTTP base URLs. |
 | `unicode-width` | Measure terminal display-cell width when sanitizing and bounding remote text and compact rows. |
+| `clap` | Typed CLI flags and environment integration. |
 
 Planned production dependencies are added only with the roadmap task that uses them:
 
 | Crate | Planned purpose |
 | --- | --- |
-| `clap` | Typed CLI flags and environment integration. |
 | `color-eyre` | Error reports while preserving terminal cleanup. |
 
 Redacted file tracing intentionally uses no `tracing`/`tracing-subscriber`; the self-contained `FileLog` in `src/log.rs` keeps the dependency set smallest while meeting the tracing acceptance.

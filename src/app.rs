@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     api::{ApiError, CoinGeckoClient, FetchOutcome, MarketData},
+    config::Config,
     domain::{CoinMarket, MarketSnapshot},
     log::FileLog,
     tui, ui,
@@ -178,9 +179,6 @@ impl SortState {
 /// Cap the search buffer so a long typed query cannot overflow the layout.
 const MAX_SEARCH_CHARS: usize = 64;
 
-/// Default automatic refresh cadence. The eventual CLI flag (`--refresh-seconds`)
-/// will override it; the architecture floor is 15 seconds.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Capped jittered backoff base and ceiling for transient failures.
 const BACKOFF_BASE_MS: u64 = 2_000;
 const BACKOFF_MAX_MS: u64 = 60_000;
@@ -282,7 +280,13 @@ fn pseudo_random(seed: u64) -> u64 {
 }
 
 impl App {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_refresh_interval(Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS))
+    }
+
+    /// An `App` whose automatic refresh cadence comes from validated config.
+    pub fn with_refresh_interval(interval: Duration) -> Self {
         Self {
             state: DataState::Initial,
             generation: 0,
@@ -292,7 +296,7 @@ impl App {
             search: SearchState::default(),
             sort: SortState::default(),
             help_open: false,
-            schedule: RefreshScheduler::new(tokio::time::Instant::now(), REFRESH_INTERVAL),
+            schedule: RefreshScheduler::new(tokio::time::Instant::now(), interval),
         }
     }
 
@@ -634,7 +638,16 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         Self::with_tracer(provider, None)
     }
 
+    #[cfg(test)]
     pub fn with_tracer(provider: Arc<P>, tracer: Option<FileLog>) -> Self {
+        Self::with_interval(
+            provider,
+            tracer,
+            Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS),
+        )
+    }
+
+    pub fn with_interval(provider: Arc<P>, tracer: Option<FileLog>, interval: Duration) -> Self {
         let (events, results) = mpsc::channel(16);
         Self {
             provider,
@@ -643,7 +656,7 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
             cancellation: CancellationToken::new(),
             active: None,
             tracer,
-            app: App::new(),
+            app: App::with_refresh_interval(interval),
         }
     }
 
@@ -728,53 +741,33 @@ impl<P: MarketData + ?Sized> Drop for Controller<P> {
     }
 }
 
-pub async fn run() -> io::Result<()> {
-    let provider = configured_provider()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let tracer = configured_log()?;
+pub async fn run(config: Config) -> io::Result<()> {
+    let api_key = config.api_key.clone().filter(|key| !key.is_empty());
+    debug_assert_eq!(config.currency, "usd");
+    let provider = CoinGeckoClient::new(&config.base_url, api_key.clone())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let tracer = open_log(&config, api_key)?;
     let mut session = tui::enter()?;
-    let result = run_loop(session.terminal_mut(), Arc::new(provider), tracer).await;
+    let result = run_loop(
+        session.terminal_mut(),
+        Arc::new(provider),
+        tracer,
+        config.refresh_seconds,
+    )
+    .await;
     let restore_result = session.restore();
     result.and(restore_result)
 }
 
-fn configured_provider() -> Result<CoinGeckoClient, String> {
-    let base = match std::env::var("COIN_TUI_BASE_URL") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "https://api.coingecko.com/".to_owned(),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("COIN_TUI_BASE_URL is not valid Unicode".into())
-        }
+/// Diagnostics logger from validated config. The API key is registered as a
+/// redaction secret so no accidental caption can spill it. Opening the file
+/// happens before terminal entry, so a bad path fails early and cleanly.
+fn open_log(config: &Config, api_key: Option<String>) -> io::Result<Option<FileLog>> {
+    let Some(path) = config.log_file.as_deref() else {
+        return Ok(None);
     };
-    let key = match std::env::var("COIN_TUI_API_KEY") {
-        Ok(value) if !value.is_empty() => Some(value),
-        Ok(_) | Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err("COIN_TUI_API_KEY is not valid Unicode".into())
-        }
-    };
-    CoinGeckoClient::new(&base, key).map_err(|error| error.to_string())
-}
-
-/// Diagnostics logger from `COIN_TUI_LOG_FILE`, if configured. The API key is
-/// registered as a redaction secret so no accidental caption can spill it.
-fn configured_log() -> io::Result<Option<FileLog>> {
-    let path = match std::env::var("COIN_TUI_LOG_FILE") {
-        Ok(value) if !value.is_empty() => value,
-        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
-        Err(std::env::VarError::NotUnicode(_)) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "COIN_TUI_LOG_FILE is not valid Unicode",
-            ))
-        }
-    };
-    let secrets = std::env::var("COIN_TUI_API_KEY")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(|key| vec![key])
-        .unwrap_or_default();
-    FileLog::append_at(Path::new(&path), secrets)
+    let secrets = api_key.map(|key| vec![key]).unwrap_or_default();
+    FileLog::append_at(Path::new(path), secrets)
         .map(Some)
         .map_err(|error| io::Error::other(format!("cannot open log file {path}: {error}")))
 }
@@ -783,9 +776,17 @@ async fn run_loop<P: MarketData + 'static>(
     terminal: &mut tui::AppTerminal,
     provider: Arc<P>,
     tracer: Option<FileLog>,
+    refresh_seconds: u64,
 ) -> io::Result<()> {
     let mut draw = |app: &App| terminal.draw(|frame| ui::render(frame, app)).map(|_| ());
-    run_loop_with_sources_and_tracer(provider, EventStream::new(), &mut draw, tracer).await
+    run_loop_with_sources_and_tracer(
+        provider,
+        EventStream::new(),
+        &mut draw,
+        tracer,
+        Duration::from_secs(refresh_seconds),
+    )
+    .await
 }
 
 /// The controller loop is kept independent of the terminal so lifecycle and
@@ -797,7 +798,14 @@ where
     S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
     R: FnMut(&App) -> io::Result<()>,
 {
-    run_loop_with_sources_and_tracer(provider, input, render, None).await
+    run_loop_with_sources_and_tracer(
+        provider,
+        input,
+        render,
+        None,
+        Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS),
+    )
+    .await
 }
 
 async fn run_loop_with_sources_and_tracer<P, S, R>(
@@ -805,13 +813,14 @@ async fn run_loop_with_sources_and_tracer<P, S, R>(
     mut input: S,
     mut render: R,
     tracer: Option<FileLog>,
+    refresh_interval: Duration,
 ) -> io::Result<()>
 where
     P: MarketData + 'static,
     S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
     R: FnMut(&App) -> io::Result<()>,
 {
-    let mut controller = Controller::with_tracer(provider, tracer);
+    let mut controller = Controller::with_interval(provider, tracer, refresh_interval);
     let session_log = controller.tracer.clone();
     let loop_result = async {
         controller.start_initial_refresh();
@@ -1926,6 +1935,7 @@ mod tests {
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
+            Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS),
         )
         .await;
         assert!(result.is_ok());
@@ -1958,6 +1968,7 @@ mod tests {
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
+            Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS),
         )
         .await;
         assert!(result.is_ok());
