@@ -126,6 +126,7 @@ Configuration comes from environment variables and CLI flags:
 | --- | --- | --- |
 | `COIN_TUI_API_KEY` | unset | CoinGecko Demo API key, sent as `x-cg-demo-api-key`. |
 | `COIN_TUI_BASE_URL` | CoinGecko Demo URL | Test or alternate compatible endpoint. |
+| `COIN_TUI_LOG_FILE` | unset | Append redacted diagnostics to this file; logs stay off the alternate screen. |
 | `--refresh-seconds` | `60` | Automatic refresh interval, minimum 15 seconds. |
 | `--currency` | `usd` | Quote currency; MVP accepts USD only and validates explicitly. |
 
@@ -135,6 +136,10 @@ Never log the key or include it in an error. Configure one reusable `reqwest::Cl
 
 A `RefreshScheduler` in `App` owns the only refresh cadence. A success marks `next_auto_at = now + interval` (default 60 seconds) and clears cooldown; a failure opens a cooldown window (`next_auto_at = now + delay`) during which neither the automatic tick nor a manual `r` may start a refresh. The delay is the exact `Retry-After` (floored at one second) when a `429` provides one, capped equal-jittered exponential backoff (`[scaled/2, scaled]`, `scaled = min(2s · 2^failures, 60s)`) for transient transport, timeout, `5xx`, and bare-`429` failures, and the steady 60-second gate for other errors. A manual refresh is allowed again as soon as the window passes; a success resets failures, cooldown, and the interval. The main loop emits a low-frequency `Tick` (one second, first tick delayed) that re-renders relative timestamps and lets the scheduler start automatic refreshes; the scheduler never starts a second fetch while one is in flight.
 
+
+### Redacted File Tracing
+
+When `COIN_TUI_LOG_FILE` is set, a shared `FileLog` (`src/log.rs`) appends timestamped diagnostic lines to that file. It is written outside the alternate screen and is always best-effort: a poison-ed lock or failed write never takes the application down. The API key is registered as a redaction secret, and every line is scrubbed before a single byte reaches disk, so even an accidental caption cannot spill it. The refresh lifecycle emits compact events: `session start`, `refresh start generation=N`, `refresh ok generation=N coins=M`, `refresh failed generation=N error=<redacted>`, and `loop stopped success=true`. Errors use `ApiError`'s redacting `Display`, which never echoes a response body, so hostile or oversized bodies cannot leak their contents into the file.
 
 Provider verification and fixture rules are defined in `TESTING.md`.
 
@@ -162,9 +167,10 @@ Planned production dependencies are added only with the roadmap task that uses t
 | --- | --- |
 | `clap` | Typed CLI flags and environment integration. |
 | `color-eyre` | Error reports while preserving terminal cleanup. |
-| `tracing`, `tracing-subscriber` | Redacted diagnostics to a file. |
 
-Expected development dependencies are `wiremock` for HTTP-boundary tests and `tempfile` for isolated files. The `tokio` `test-util` feature (dev-only) enables paused-time tests for refresh scheduling. Add `insta`, `proptest`, Axum, or a database only when a roadmap task demonstrates a concrete need.
+Redacted file tracing intentionally uses no `tracing`/`tracing-subscriber`; the self-contained `FileLog` in `src/log.rs` keeps the dependency set smallest while meeting the tracing acceptance.
+
+Expected development dependencies are `wiremock` for HTTP-boundary tests and `tempfile` for isolated files; both are in use. The `tokio` `test-util` feature (dev-only) enables paused-time tests for refresh scheduling. Add `insta`, `proptest`, Axum, or a database only when a roadmap task demonstrates a concrete need.
 
 Pin the Rust toolchain in `rust-toolchain.toml`. Let `Cargo.lock` pin crate versions for reproducible application builds; do not hard-code versions in this specification.
 

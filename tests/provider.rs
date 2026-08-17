@@ -401,14 +401,50 @@ async fn enforces_json_type_and_streaming_size_limit() {
         ApiError::MalformedResponse
     );
     let huge = MockServer::start().await;
-    let body = format!("[{}]", "0,".repeat(2 * 1024 * 1024));
+    // A body well past the 2 MiB response cap that also carries the key text.
+    let body = format!(
+        "[{}]",
+        "\"secret-key-in-oversize\","
+            .repeat(300_000)
+            .trim_end_matches(',')
+    );
     Mock::given(method("GET"))
         .respond_with(json(&body))
         .mount(&huge)
         .await;
-    assert_eq!(
-        client(&huge, None).fetch_markets().await.unwrap_err(),
-        ApiError::MalformedResponse
+    let error = client(&huge, Some("header-secret".into()))
+        .fetch_markets()
+        .await
+        .unwrap_err();
+    assert_eq!(error, ApiError::MalformedResponse);
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    assert!(!display.contains("header-secret"), "display leaked the key");
+    assert!(!display.contains("secret-key-in-oversize"));
+    assert!(!debug.contains("header-secret"), "debug leaked the key");
+    assert!(!debug.contains("secret-key-in-oversize"));
+}
+
+#[tokio::test]
+async fn hostile_control_characters_pass_through_the_provider_boundary_for_render_sanitization() {
+    let server = MockServer::start().await;
+    let body = r#"[{"id":"bitcoin","name":"\u001b[31mBitcoin\u200e\u0000\u0007\u007f","symbol":"\u001b[1mBTC\u200b","market_cap_rank":1,"current_price":50000}]"#;
+    Mock::given(method("GET"))
+        .respond_with(json(body))
+        .mount(&server)
+        .await;
+
+    let snapshot = client(&server, None).fetch_markets().await.unwrap();
+    let coin = &snapshot.coins()[0];
+    assert_eq!(coin.id(), "bitcoin");
+    assert!(
+        coin.name().contains('\u{001b}') && coin.name().contains('\u{200e}'),
+        "provider text reaches the domain raw: {:?}",
+        coin.name()
+    );
+    assert!(
+        coin.symbol().contains('\u{001b}') && coin.symbol().contains('\u{200b}'),
+        "provider symbol reaches the domain raw"
     );
 }
 

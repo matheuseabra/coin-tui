@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod domain;
 mod format;
+mod log;
 mod tui;
 mod ui;
 

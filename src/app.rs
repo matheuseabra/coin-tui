@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     io,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     api::{ApiError, CoinGeckoClient, FetchOutcome, MarketData},
     domain::{CoinMarket, MarketSnapshot},
+    log::FileLog,
     tui, ui,
 };
 
@@ -622,11 +624,17 @@ pub struct Controller<P: MarketData + ?Sized> {
     results: mpsc::Receiver<Event>,
     cancellation: CancellationToken,
     active: Option<JoinHandle<()>>,
+    tracer: Option<FileLog>,
     pub app: App,
 }
 
 impl<P: MarketData + ?Sized + 'static> Controller<P> {
+    #[cfg(test)]
     pub fn new(provider: Arc<P>) -> Self {
+        Self::with_tracer(provider, None)
+    }
+
+    pub fn with_tracer(provider: Arc<P>, tracer: Option<FileLog>) -> Self {
         let (events, results) = mpsc::channel(16);
         Self {
             provider,
@@ -634,6 +642,7 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
             results,
             cancellation: CancellationToken::new(),
             active: None,
+            tracer,
             app: App::new(),
         }
     }
@@ -648,7 +657,14 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         }
     }
 
+    fn trace(&self, message: String) {
+        if let Some(log) = &self.tracer {
+            log.info(&message);
+        }
+    }
+
     fn start_fetch(&mut self, generation: u64) {
+        self.trace(format!("refresh start generation={generation}"));
         let provider = Arc::clone(&self.provider);
         let sender = self.events.clone();
         let cancelled = self.cancellation.clone();
@@ -665,7 +681,22 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
     }
 
     pub async fn handle(&mut self, event: Event) -> Command {
+        let trace_line = match &event {
+            Event::FetchResult { generation, result } => Some(match result {
+                Ok(outcome) => format!(
+                    "refresh ok generation={generation} coins={}",
+                    outcome.snapshot.coins().len()
+                ),
+                Err(error) => format!("refresh failed generation={generation} error={error}"),
+            }),
+            _ => None,
+        };
         let command = self.app.update(event);
+        if let Some(trace_line) = trace_line {
+            if !matches!(command, Command::None) {
+                self.trace(trace_line);
+            }
+        }
         if let Command::Fetch { generation } = command {
             self.start_fetch(generation);
         }
@@ -700,8 +731,9 @@ impl<P: MarketData + ?Sized> Drop for Controller<P> {
 pub async fn run() -> io::Result<()> {
     let provider = configured_provider()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let tracer = configured_log()?;
     let mut session = tui::enter()?;
-    let result = run_loop(session.terminal_mut(), Arc::new(provider)).await;
+    let result = run_loop(session.terminal_mut(), Arc::new(provider), tracer).await;
     let restore_result = session.restore();
     result.and(restore_result)
 }
@@ -724,29 +756,68 @@ fn configured_provider() -> Result<CoinGeckoClient, String> {
     CoinGeckoClient::new(&base, key).map_err(|error| error.to_string())
 }
 
+/// Diagnostics logger from `COIN_TUI_LOG_FILE`, if configured. The API key is
+/// registered as a redaction secret so no accidental caption can spill it.
+fn configured_log() -> io::Result<Option<FileLog>> {
+    let path = match std::env::var("COIN_TUI_LOG_FILE") {
+        Ok(value) if !value.is_empty() => value,
+        Ok(_) | Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "COIN_TUI_LOG_FILE is not valid Unicode",
+            ))
+        }
+    };
+    let secrets = std::env::var("COIN_TUI_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|key| vec![key])
+        .unwrap_or_default();
+    FileLog::append_at(Path::new(&path), secrets)
+        .map(Some)
+        .map_err(|error| io::Error::other(format!("cannot open log file {path}: {error}")))
+}
+
 async fn run_loop<P: MarketData + 'static>(
     terminal: &mut tui::AppTerminal,
     provider: Arc<P>,
+    tracer: Option<FileLog>,
 ) -> io::Result<()> {
     let mut draw = |app: &App| terminal.draw(|frame| ui::render(frame, app)).map(|_| ());
-    run_loop_with_sources(provider, EventStream::new(), &mut draw).await
+    run_loop_with_sources_and_tracer(provider, EventStream::new(), &mut draw, tracer).await
 }
 
 /// The controller loop is kept independent of the terminal so lifecycle and
 /// concurrency behavior can be tested with deterministic event streams.
-async fn run_loop_with_sources<P, S, R>(
+#[cfg(test)]
+async fn run_loop_with_sources<P, S, R>(provider: Arc<P>, input: S, render: R) -> io::Result<()>
+where
+    P: MarketData + 'static,
+    S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
+    R: FnMut(&App) -> io::Result<()>,
+{
+    run_loop_with_sources_and_tracer(provider, input, render, None).await
+}
+
+async fn run_loop_with_sources_and_tracer<P, S, R>(
     provider: Arc<P>,
     mut input: S,
     mut render: R,
+    tracer: Option<FileLog>,
 ) -> io::Result<()>
 where
     P: MarketData + 'static,
     S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
     R: FnMut(&App) -> io::Result<()>,
 {
-    let mut controller = Controller::new(provider);
+    let mut controller = Controller::with_tracer(provider, tracer);
+    let session_log = controller.tracer.clone();
     let loop_result = async {
         controller.start_initial_refresh();
+        if let Some(log) = &session_log {
+            log.trace("info", "session start");
+        }
         render(&controller.app)?;
         // Low-frequency tick: refreshes relative timestamps, re-renders, and
         // lets the refresh scheduler start automatic refreshes. The first
@@ -785,6 +856,12 @@ where
         }
     };
     let loop_result = loop_result.await;
+    if let Some(log) = &session_log {
+        log.trace(
+            "info",
+            &format!("loop stopped success={}", loop_result.is_ok()),
+        );
+    }
     let shutdown_result = controller.shutdown().await;
     match loop_result {
         Err(error) => Err(error),
@@ -900,6 +977,7 @@ mod tests {
     use super::*;
     use crate::domain::{CoinMarketInput, MarketSummaryInput};
     use futures_util::stream;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1005,6 +1083,42 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(async { Ok(outcome(snapshot())) })
         }
+    }
+
+    /// A provider whose refresh always fails with a transport error.
+    struct FailingProvider;
+
+    impl MarketData for FailingProvider {
+        fn fetch_snapshot<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<FetchOutcome, ApiError>> + Send + 'a>> {
+            Box::pin(async { Err(ApiError::Transport) })
+        }
+    }
+
+    fn render_text(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// An input stream that sleeps once, then signals end-of-input so a
+    /// running loop reaches a controlled, success=true shutdown.
+    fn eof_after(
+        delay: Duration,
+    ) -> Pin<Box<dyn Stream<Item = Result<CrosstermEvent, io::Error>> + Send>> {
+        Box::pin(stream::unfold(delay, |delay| async move {
+            tokio::time::sleep(delay).await;
+            None::<(Result<CrosstermEvent, io::Error>, Duration)>
+        }))
     }
 
     #[test]
@@ -1727,6 +1841,158 @@ mod tests {
         );
         task.abort();
         task.await.unwrap_err();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hostile_provider_fixtures_never_corrupt_the_terminal_or_leak_the_key() {
+        let key = "super-secret-api-key";
+        let hostile_body = format!(
+            r#"[{{"id":"bitcoin","name":"{name}","symbol":"{symbol}","market_cap_rank":1,"current_price":50000,"market_cap":1000000,"sparkline_in_7d":{{"price":[1]}}}}]"#,
+            name = "\\u001b[31mBitcoin\\u200e\\u0000\\u0007\\u007f",
+            symbol = "\\u001b[1mBTC\\u200b",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/coins/markets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(hostile_body.as_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/global"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                br#"{"data":{"total_market_cap":{"usd":1},"total_volume":{"usd":2},"market_cap_percentage":{"btc":3},"market_cap_change_percentage_24h_usd":4}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider = Arc::new(
+            CoinGeckoClient::with_timeouts(
+                &server.uri(),
+                Some(key.into()),
+                Duration::from_millis(100),
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+        );
+        let mut controller = Controller::with_tracer(provider, None);
+        controller.start_initial_refresh();
+        let event = controller.next_event().await.expect("one refresh result");
+        controller.handle(event).await;
+        controller.shutdown().await.unwrap();
+
+        assert!(matches!(controller.app.state(), DataState::Ready { .. }));
+        let rendered = render_text(&controller.app);
+        assert!(
+            rendered.chars().all(|character| !character.is_control()),
+            "terminal text contains control characters: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{200e}') && !rendered.contains('\u{200b}'));
+        assert!(
+            rendered.contains("Bitcoin") && rendered.contains("BTC"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains(key),
+            "key leaked into the screen: {rendered:?}"
+        );
+
+        let requests = server.received_requests().await.unwrap();
+        let markets = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/v3/coins/markets")
+            .unwrap();
+        assert_eq!(
+            markets.headers.get("x-cg-demo-api-key").unwrap(),
+            key,
+            "the key must be sent as the provider header"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn traced_session_logs_redact_the_key_and_record_the_refresh_timeline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        let key = "plumbus-secret-key";
+        let tracer = Some(FileLog::append_at(&path, vec![key.into()]).unwrap());
+        let result = run_loop_with_sources_and_tracer(
+            Arc::new(CountingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            eof_after(Duration::from_millis(50)),
+            |_| Ok(()),
+            tracer,
+        )
+        .await;
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&path).unwrap();
+        for expected in [
+            "session start",
+            "refresh start generation=1",
+            "refresh ok generation=1 coins=1",
+            "loop stopped success=true",
+        ] {
+            assert!(
+                content.contains(expected),
+                "missing {expected:?} in {content}"
+            );
+        }
+        assert!(
+            !content.contains(key),
+            "key leaked into the trace log: {content}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn traced_failed_refresh_logs_the_error_without_the_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("failure.log");
+        let key = "another-secret-key";
+        let tracer = Some(FileLog::append_at(&path, vec![key.into()]).unwrap());
+        let result = run_loop_with_sources_and_tracer(
+            Arc::new(FailingProvider),
+            eof_after(Duration::from_millis(50)),
+            |_| Ok(()),
+            tracer,
+        )
+        .await;
+        assert!(result.is_ok());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("refresh failed generation=1 error=API transport failed"),
+            "{content}"
+        );
+        assert!(
+            !content.contains(key),
+            "key leaked into the trace log: {content}"
+        );
+    }
+
+    #[test]
+    fn malformed_response_keeps_last_good_rows_and_renders_cleanly() {
+        let mut app = loaded_app(snapshot());
+        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+            panic!()
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Err(ApiError::MalformedResponse),
+        });
+        assert!(matches!(app.state(), DataState::Stale { .. }));
+        let rendered = render_text(&app);
+        assert!(rendered.contains("STALE"), "{rendered:?}");
+        assert!(
+            rendered.chars().all(|character| !character.is_control()),
+            "oversized-as-malformed responses must not corrupt the terminal: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("STALE") && rendered.contains("X"),
+            "{rendered:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
