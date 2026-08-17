@@ -17,13 +17,16 @@ $ cd coin-tui
 ## run
 
 ```sh
-$ cargo run --lock
+$ cargo run --locked
 ```
+
 ## controls
 
 - `/`: filter by name
 - `r`: refresh market data
-- `q` or `Ctrl-C`: quit
+- `s` or `Ctrl-S`: cycle sort order
+- `q` or `Ctrl-q`: quit
+- `?`: helper commands
 
 ## tech stack
 - rust
