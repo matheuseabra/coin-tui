@@ -2,7 +2,7 @@
 
 ## Roles
 
-The main agent is the planner. Executors are GPT-5.6 Luna subagents running at Max reasoning effort. Verifiers and adversarial reviewers are GPT-5.6 Terra subagents running at High reasoning effort.
+The main agent is the planner. Executors are `opencode-go/deepseek-v4-flash` subagents. Verifiers and adversarial reviewers are `opencode-go/deepseek-v4-pro` subagents. They run on an API-key provider; if the OpenAI ChatGPT account resumes headroom, the planner may switch these back by editing `.opencode/agents/*.md` model lines.
 
 Use one executor, one verifier, and one adversarial reviewer by default. The planner may run up to three executors concurrently only when tasks are independent, have disjoint file ownership, and can be verified separately. Verification and review agents are read-only and do not repair findings. The planner keeps integration, roadmap edits, dependency decisions, conflict resolution, repair orders, and final acceptance in the main thread.
 

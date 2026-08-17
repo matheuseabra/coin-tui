@@ -76,39 +76,48 @@ Goal: deliver the image reference's scanability in compact, standard, and full t
   Depends on: `G1`.
   Acceptance: table-driven tests cover zero, signs, sub-cent prices, trillions, rounding boundaries, and missing values.
   Evidence: Locale-independent bounded formatters cover prices, signed percentages, compact USD/supply, age, missing/non-finite values, unit rollover, negative zero, tiny prices, and extremes; 59 locked offline tests, Terra verification, and adversarial review passed.
-- [ ] `M2-02` Build the summary row and status line.
+- [x] `M2-02` Build the summary row and status line.
   Depends on: `M2-01`.
   Acceptance: summary metrics retain labels without relying on color and degrade to one line below 80 columns.
-  Blocked: Implementation and 62 locked offline tests pass, but required Terra verification and adversarial review are unavailable because the provider account returns HTTP `429` before execution.
-- [ ] `M2-03` Build the ranked table, selection style, scrolling, and positive/negative styling.
+  Evidence: Labeled cap/volume/dominance/change metrics render with `-` for missing and bounded `$999T+`/`>999K%` extremes; compact form is a single ≤58-cell line below 80 columns; status line names every state with age, notice, and controls, keeps `q quit | r refresh` visible at 60 columns by dropping the degraded marker and age detail in order; width-appropriate placeholders for Initial/Loading/Fatal; 76 locked offline tests (46 unit + 30 provider), fmt, Clippy with denied warnings, and locked build pass; Terra-independent verification passed twice and adversarial review found no critical or high findings (two low findings repaired with regression tests).
+- [x] `M2-03` Build the ranked table, selection style, scrolling, and positive/negative styling.
   Depends on: `M2-01`.
   Acceptance: rows align for mixed symbol/name lengths; missing values cannot shift columns; selected row remains visible.
-- [ ] `M2-04` Render normalized 7-day sparklines in full mode.
+  Evidence: A real ratatui `Table` with fixed-width columns per mode renders rank, name/symbol, price, 1h/24h/7d, cap, and full-mode volume/supply; missing values render `-` without shifting columns; reversed selection auto-scrolls into view; sign-colored changes keep explicit `+`/`-` text; wrapped info lines reserve word-boundary-exact rows at 60x16; 73 locked offline tests (43 unit + 30 provider), fmt, Clippy with denied warnings, and locked build pass; Terra-independent verification passed three rounds and adversarial review found no critical or high findings (three low findings repaired with regression tests, latent estimator and overflow defects hardened).
+- [x] `M2-04` Render normalized 7-day sparklines in full mode.
   Depends on: `M2-03`.
   Acceptance: flat, rising, falling, one-point, missing, and non-finite source series render without panic.
-- [ ] `M2-05` Implement responsive layouts and resize handling.
+  Evidence: Whole-series downsampled min-max normalization maps buckets into 8 block glyphs; flat renders at mid level, empty and all-non-finite render `-`, overflowed ranges fall back to flat, and 168-point series keep direction after downsampling to the 10-cell Trend column; a full-mode 120x30 render shows the actual `▁▃▆█▆▃▁` series and the missing case keeps the header; 80 locked offline tests (50 unit + 30 provider), fmt, Clippy with denied warnings, and locked debug and release builds pass.
+- [x] `M2-05` Implement responsive layouts and resize handling.
   Depends on: `M2-02`, `M2-03`, `M2-04`.
   Acceptance: `TestBackend` checks at 60x16, 79x20, 80x24, 119x30, and 120x30 confirm the documented mode and no out-of-bounds rendering.
+  Evidence: `render` guards below the 60x16 minimum with a centered resize message that keeps `q quits` visible at 59x15, 20x5, 80x10, and 60x8 without a panic; the five required sizes render the correct column set (compact Symbol/Price/24h without Trend/Supply at 60x16 and 79x20; standard Sym/1h/7d/Cap without Trend/Supply at 80x24 and 119x30; full Trend/Vol/Supply/7d at 120x30) and every draw completes in-bounds; 82 locked offline tests (52 unit + 30 provider), fmt, Clippy with denied warnings, and locked debug and release builds pass.
 
 Quality gate `G2`:
 
-- [ ] All M2 tasks are accepted and required checks pass.
-- [ ] Manual review confirms readable output in a truecolor terminal and with `NO_COLOR=1`.
-- [ ] Manual resize across all breakpoints shows no panic, stale artifacts, or lost selection.
+- [x] All M2 tasks are accepted and required checks pass.
+  Evidence: `M2-01` through `M2-05` are accepted with their acceptance criteria, and formatted both ways, Clippy with denied warnings, 82 locked offline (52 unit + 30 provider) tests, and locked debug and release builds pass on Rust 1.97.1.
+- [x] Manual review confirms readable output in a truecolor terminal and with `NO_COLOR=1`.
+  Evidence: Release binary against a loopback fixture server in tmux 120x30 shows a labeled summary, the full column set, sign-colored changes, and 10-glyph sparklines; `capture-pane -e` shows truecolor `38;2`/`48;2` codes without NO_COLOR and only bold/reset codes (no color SGR) with `NO_COLOR=1`, with sparklines and sign text still readable. Quit restores the shell prompt each time.
+- [x] Manual resize across all breakpoints shows no panic, stale artifacts, or lost selection.
+  Evidence: tmux resizes to 59x15 (centered `Terminal too small` message plus `q quits`, quit still restores), 79x20 (compact Symbol/Price/24h), 80x24 and 119x30 (standard Coin/Sym/1h/24h/7d/Cap), and 120x30 (full with Vol/Supply/Trend sparkline); every pane has intact borders with no leftover cells and the first row persists across mode switches.
 
 ## M3: Navigation And Discovery
 
 Goal: make a 100-row market list fast to inspect without a mouse.
 
-- [ ] `M3-01` Implement row, viewport, first, and last navigation.
+- [x] `M3-01` Implement row, viewport, first, and last navigation.
   Depends on: `G2`.
   Acceptance: boundary and empty-list tests cover every key in the `docs/PRODUCT.md` interaction contract.
-- [ ] `M3-02` Implement search mode over names and symbols.
+  Evidence: `j`/`Down`, `k`/`Up`, `g`/`Home`, `G`/`End`, and `PageUp`/`PageDown` route through one `navigate` transition that clamps at the first and last row, pages by the resize-derived viewport (`height - 7` table chrome, floored at 1), and no-ops on an empty list; resize dimensions now feed the viewport through `Event::Resize { height }`; 86 locked offline tests (56 unit + 30 provider) plus fmt, Clippy with denied warnings, and locked debug and release builds pass; a live 80x24 loopback run confirmed selection follows `jjj`, `G` scrolls to row 100, `kk` and page keys keep the reversed highlight in view, and `q` restores the shell prompt.
+- [x] `M3-02` Implement search mode over names and symbols.
   Depends on: `M3-01`.
   Acceptance: typing does not trigger global shortcuts; apply, cancel, no-results, Unicode input, and selection retention are tested.
-- [ ] `M3-03` Implement stable sort cycling with missing values last.
+  Evidence: `/` opens an editing prompt (`search:<buffer>_ | Esc cancel | Enter apply`) where printable chars/Backspace fill a bounded 64-scalar buffer without triggering global shortcuts (`r`/`j`/`k`/`q`/`g`/`G` are typed, hard `Ctrl-C` still quits); `Enter` commits and `Esc` cancels editing or clears a committed filter; the filter matches a coin when its lowercased name or symbol contains the lowercased query and selection re-anchors to the same coin id when it still matches, clamping otherwise; the table renders only visible rows and shows a centered no-results message with edit/clear hints at zero matches; `filter: <query> (<count>)` appears in the status line; 12 new tests cover shortcuts, apply, cancel, no-results, Unicode, backspace-by-scalar, buffer bound, and retention; 97 locked offline tests (67 unit + 30 provider) plus fmt, Clippy with denied warnings, and locked build pass; a live 80x24 loopback run showed `/bit` narrowing to Bitcoin+Bitbo with `filter: bit (2)`, the typing prompt, `No coins match "zz"` after `Enter`, `Esc` restoring all rows, and `q` restoring the shell prompt.
+- [x] `M3-03` Implement stable sort cycling with missing values last.
   Depends on: `M3-01`.
   Acceptance: every visible numeric column sorts in both directions with deterministic ties.
+  Evidence: `s` advances and `Shift-S` steps backward through a fixed 16-step cycle (rank, price, 1h, 24h, 7d, cap, volume, supply × ascending/descending) that wraps at the default rank order; sorting runs on the already-filtered visible set, missing values sort last in both directions, equal finite values keep snapshot order (stable `sort_by` with a non-`NaN`-leaking comparator), and selection re-anchors to the same coin id after reordering; the status line shows `sort: <key> ↑/↓` and drops it in the default rank order; 104 locked offline tests (74 unit + 30 provider) plus fmt, Clippy with denied warnings, and locked debug and release builds pass; a live 80x24 loopback run confirmed `sss` → `sort: price ↓` order (Bitcoin, Ethereum, Solana, Litecoin, Bitbo, Cardano), `Shift-S` → `price ↑`, two more `Shift-S` → `rank ↓` then back to default rank order with the indicator gone, and `q` restored the shell prompt. A latent M3-02 selection-retention bug (the anchor was captured after the query changed) was fixed by capturing the coin id before the visible set changes, with a new regression test.
 - [ ] `M3-04` Add a contextual help overlay.
   Depends on: `M3-01`, `M3-02`, `M3-03`.
   Acceptance: help lists only implemented bindings, fits the minimum supported size, and closes with `?` or `Esc`.

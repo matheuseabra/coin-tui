@@ -1,7 +1,7 @@
 ---
 description: Implements one bounded roadmap work order and returns evidence to the planner
 mode: subagent
-model: openai/gpt-5.6-luna#max
+model: opencode-go/deepseek-v4-flash
 color: "#9b6cff"
 steps: 50
 permissions:

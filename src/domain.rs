@@ -125,7 +125,8 @@ impl MarketSummary {
 }
 
 impl CoinMarket {
-    #[cfg(test)]
+    /// Stable provider id used to keep selection on the same coin when the
+    /// visible set changes (search filtering and sorting).
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -141,31 +142,24 @@ impl CoinMarket {
     pub fn price(&self) -> Option<f64> {
         self.price
     }
-    #[cfg(test)]
     pub fn change_1h(&self) -> Option<f64> {
         self.change_1h
     }
-    #[cfg(test)]
     pub fn change_24h(&self) -> Option<f64> {
         self.change_24h
     }
-    #[cfg(test)]
     pub fn change_7d(&self) -> Option<f64> {
         self.change_7d
     }
-    #[cfg(test)]
     pub fn market_cap(&self) -> Option<f64> {
         self.market_cap
     }
-    #[cfg(test)]
     pub fn volume_24h(&self) -> Option<f64> {
         self.volume_24h
     }
-    #[cfg(test)]
     pub fn circulating_supply(&self) -> Option<f64> {
         self.circulating_supply
     }
-    #[cfg(test)]
     pub fn sparkline_7d(&self) -> &[f64] {
         &self.sparkline_7d
     }

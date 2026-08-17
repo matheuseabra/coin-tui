@@ -1,7 +1,7 @@
 ---
 description: Independently verifies roadmap acceptance criteria and reports evidence without editing
 mode: subagent
-model: openai/gpt-5.6-terra#high
+model: opencode-go/deepseek-v4-pro
 color: "#32b67a"
 steps: 35
 permissions:

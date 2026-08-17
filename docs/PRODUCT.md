@@ -81,7 +81,7 @@ The minimum supported terminal is 60 columns by 16 rows. Below that size, the pr
 | `r` | Request a refresh unless one is active or cooling down. |
 | `?` | Toggle keybinding help. |
 
-Search is case-insensitive over coin name and symbol. Sorting is stable, missing values sort last, and selection remains on the same coin ID when possible.
+Search is case-insensitive over coin name and symbol. Sorting is stable, missing values sort last, and selection remains on the same coin ID when possible. Each sortable numeric column appears in the cycle in both directions: `s` advances through rank, price, 1h, 24h, 7d, cap, volume, and supply (ascending then descending) and `Shift-S` steps backward. The status line shows the active key and direction; the default rank order shows no indicator.
 
 ## User-Facing States
 

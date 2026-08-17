@@ -1,7 +1,7 @@
 ---
 description: Adversarially reviews verified changes for defects, regressions, and missing tests without editing
 mode: subagent
-model: openai/gpt-5.6-terra#high
+model: opencode-go/deepseek-v4-pro
 color: "#ef6a6a"
 steps: 35
 permissions:
