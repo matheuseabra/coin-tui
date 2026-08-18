@@ -58,6 +58,195 @@ pub struct CoinMarketInput {
     pub sparkline_7d: Vec<f64>,
 }
 
+/// Rich detail values supplied to the domain boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoinDetailInput {
+    pub id: String,
+    pub symbol: String,
+    pub name: String,
+    pub rank: Option<u32>,
+    pub price: Option<f64>,
+    pub change_1h: Option<f64>,
+    pub change_24h: Option<f64>,
+    pub change_7d: Option<f64>,
+    pub change_14d: Option<f64>,
+    pub change_30d: Option<f64>,
+    pub change_60d: Option<f64>,
+    pub change_1y: Option<f64>,
+    pub market_cap: Option<f64>,
+    pub volume_24h: Option<f64>,
+    pub high_24h: Option<f64>,
+    pub low_24h: Option<f64>,
+    pub ath: Option<f64>,
+    pub atl: Option<f64>,
+    pub ath_change: Option<f64>,
+    pub atl_change: Option<f64>,
+    pub circulating_supply: Option<f64>,
+    pub total_supply: Option<f64>,
+    pub max_supply: Option<f64>,
+    pub fully_diluted_valuation: Option<f64>,
+    pub categories: Vec<String>,
+    pub sentiment_up: Option<f64>,
+    pub sentiment_down: Option<f64>,
+    pub sparkline_7d: Vec<f64>,
+    pub description: Option<String>,
+}
+
+/// Bound remote category lists so a hostile provider cannot inflate memory.
+const MAX_CATEGORIES: usize = 8;
+
+/// Provider-independent rich coin detail, CoinMarketCap-shaped: everything
+/// from the tables row plus 24h high/low, ATH/ATL, 14d/30d/60d/1y changes,
+/// supply totals, fully diluted valuation, categories, community sentiment
+/// votes, a description snippet, and the dense hourly 7-day sparkline. It is
+/// fetched on demand when the user opens a coin detail.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CoinDetail {
+    id: String,
+    symbol: String,
+    name: String,
+    rank: Option<u32>,
+    price: Option<f64>,
+    change_1h: Option<f64>,
+    change_24h: Option<f64>,
+    change_7d: Option<f64>,
+    change_14d: Option<f64>,
+    change_30d: Option<f64>,
+    change_60d: Option<f64>,
+    change_1y: Option<f64>,
+    market_cap: Option<f64>,
+    volume_24h: Option<f64>,
+    high_24h: Option<f64>,
+    low_24h: Option<f64>,
+    ath: Option<f64>,
+    atl: Option<f64>,
+    ath_change: Option<f64>,
+    atl_change: Option<f64>,
+    circulating_supply: Option<f64>,
+    total_supply: Option<f64>,
+    max_supply: Option<f64>,
+    fully_diluted_valuation: Option<f64>,
+    categories: Vec<String>,
+    sentiment_up: Option<f64>,
+    sentiment_down: Option<f64>,
+    sparkline_7d: Vec<f64>,
+    description: Option<String>,
+}
+
+impl CoinDetail {
+    /// Build a detail while normalizing every untrusted value.
+    pub fn new(input: CoinDetailInput) -> Self {
+        let categories: Vec<String> = input
+            .categories
+            .into_iter()
+            .filter(|category| !category.is_empty())
+            .take(MAX_CATEGORIES)
+            .collect();
+        Self {
+            id: input.id,
+            symbol: input.symbol,
+            name: input.name,
+            rank: input.rank,
+            price: finite(input.price),
+            change_1h: finite(input.change_1h),
+            change_24h: finite(input.change_24h),
+            change_7d: finite(input.change_7d),
+            change_14d: finite(input.change_14d),
+            change_30d: finite(input.change_30d),
+            change_60d: finite(input.change_60d),
+            change_1y: finite(input.change_1y),
+            market_cap: finite(input.market_cap),
+            volume_24h: finite(input.volume_24h),
+            high_24h: finite(input.high_24h),
+            low_24h: finite(input.low_24h),
+            ath: finite(input.ath),
+            atl: finite(input.atl),
+            ath_change: finite(input.ath_change),
+            atl_change: finite(input.atl_change),
+            circulating_supply: finite(input.circulating_supply),
+            total_supply: finite(input.total_supply),
+            max_supply: finite(input.max_supply),
+            fully_diluted_valuation: finite(input.fully_diluted_valuation),
+            categories,
+            sentiment_up: finite(input.sentiment_up),
+            sentiment_down: finite(input.sentiment_down),
+            sparkline_7d: input
+                .sparkline_7d
+                .into_iter()
+                .filter(|value| value.is_finite())
+                .collect(),
+            description: input
+                .description
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty()),
+        }
+    }
+
+    pub fn change_7d(&self) -> Option<f64> {
+        self.change_7d
+    }
+    pub fn change_30d(&self) -> Option<f64> {
+        self.change_30d
+    }
+    pub fn change_60d(&self) -> Option<f64> {
+        self.change_60d
+    }
+    pub fn change_1y(&self) -> Option<f64> {
+        self.change_1y
+    }
+    pub fn market_cap(&self) -> Option<f64> {
+        self.market_cap
+    }
+    pub fn volume_24h(&self) -> Option<f64> {
+        self.volume_24h
+    }
+    pub fn high_24h(&self) -> Option<f64> {
+        self.high_24h
+    }
+    pub fn low_24h(&self) -> Option<f64> {
+        self.low_24h
+    }
+    pub fn ath(&self) -> Option<f64> {
+        self.ath
+    }
+    pub fn atl(&self) -> Option<f64> {
+        self.atl
+    }
+    pub fn ath_change(&self) -> Option<f64> {
+        self.ath_change
+    }
+    pub fn atl_change(&self) -> Option<f64> {
+        self.atl_change
+    }
+    pub fn circulating_supply(&self) -> Option<f64> {
+        self.circulating_supply
+    }
+    pub fn total_supply(&self) -> Option<f64> {
+        self.total_supply
+    }
+    pub fn max_supply(&self) -> Option<f64> {
+        self.max_supply
+    }
+    pub fn fully_diluted_valuation(&self) -> Option<f64> {
+        self.fully_diluted_valuation
+    }
+    pub fn categories(&self) -> &[String] {
+        &self.categories
+    }
+    pub fn sentiment_up(&self) -> Option<f64> {
+        self.sentiment_up
+    }
+    pub fn sentiment_down(&self) -> Option<f64> {
+        self.sentiment_down
+    }
+    pub fn sparkline_7d(&self) -> &[f64] {
+        &self.sparkline_7d
+    }
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
 impl MarketSnapshot {
     /// Build a snapshot while normalizing every untrusted numeric value.
     pub fn new(

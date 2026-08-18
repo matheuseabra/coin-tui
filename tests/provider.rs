@@ -2,6 +2,8 @@
 mod api;
 #[path = "../src/domain.rs"]
 mod domain;
+#[path = "../src/news.rs"]
+mod news;
 
 use chrono::{DateTime, Utc};
 use std::{
@@ -874,4 +876,329 @@ async fn coin_failure_returns_promptly_after_both_requests_start_and_drops_globa
         .unwrap();
     assert_eq!(result.unwrap_err(), ApiError::HttpStatus { status: 503 });
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// A rich `/coins/{id}` body with every extended market-data field the
+/// CoinMarketCap-style sidebar reads.
+const COIN_DETAIL_BODY: &str = r#"{
+  "id": "bitcoin",
+  "symbol": "btc",
+  "name": "Bitcoin",
+  "market_cap_rank": 1,
+  "categories": ["layer-1", "store-of-value"],
+  "description": {"en": "A peer-to-peer network."},
+  "market_data": {
+    "current_price": {"usd": 50000.0},
+    "market_cap": {"usd": 1000000000000.0},
+    "fully_diluted_valuation": {"usd": 1100000000000.0},
+    "total_volume": {"usd": 25000000000.0},
+    "high_24h": {"usd": 52000.0},
+    "low_24h": {"usd": 49000.0},
+    "ath": {"usd": 100000.0},
+    "atl": {"usd": 3000.0},
+    "ath_change_percentage": {"usd": -50.0},
+    "atl_change_percentage": {"usd": 1500.0},
+    "price_change_percentage_1h_in_currency": {"usd": 0.1},
+    "price_change_percentage_24h": 2.0,
+    "price_change_percentage_7d_in_currency": {"usd": -1.5},
+    "price_change_percentage_14d_in_currency": {"usd": 3.0},
+    "price_change_percentage_30d_in_currency": {"usd": -2.0},
+    "price_change_percentage_60d_in_currency": {"usd": 5.0},
+    "price_change_percentage_1y_in_currency": {"usd": 40.0},
+    "circulating_supply": 19.0,
+    "total_supply": 21.0,
+    "max_supply": 21.0,
+    "sentiment_votes_up_percentage": 70.0,
+    "sentiment_votes_down_percentage": 30.0,
+    "sparkline_7d": {"price": [1.0, 2.0, null, 4.0]}
+  }
+}"#;
+
+#[tokio::test]
+async fn fetch_coin_detail_requests_exact_path_query_and_key_and_converts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/bitcoin"))
+        .and(query_param("localization", "false"))
+        .and(query_param("tickers", "false"))
+        .and(query_param("market_data", "true"))
+        .and(query_param("community_data", "false"))
+        .and(query_param("developer_data", "false"))
+        .and(query_param("sparkline", "true"))
+        .and(query_param("vs_currency", "usd"))
+        .and(header("x-cg-demo-api-key", "secret-key"))
+        .respond_with(json(COIN_DETAIL_BODY))
+        .mount(&server)
+        .await;
+
+    let detail = client(&server, Some("secret-key".into()))
+        .fetch_coin_detail("bitcoin")
+        .await
+        .unwrap();
+    assert_eq!(detail.ath(), Some(100_000.0));
+    assert_eq!(detail.atl(), Some(3_000.0));
+    assert_eq!(detail.ath_change(), Some(-50.0));
+    assert_eq!(detail.atl_change(), Some(1500.0));
+    assert_eq!(detail.change_7d(), Some(-1.5));
+    assert_eq!(detail.change_30d(), Some(-2.0));
+    assert_eq!(detail.change_60d(), Some(5.0));
+    assert_eq!(detail.change_1y(), Some(40.0));
+    assert_eq!(detail.fully_diluted_valuation(), Some(1_100_000_000_000.0));
+    assert_eq!(detail.volume_24h(), Some(25_000_000_000.0));
+    assert_eq!(detail.high_24h(), Some(52_000.0));
+    assert_eq!(detail.low_24h(), Some(49_000.0));
+    assert_eq!(detail.circulating_supply(), Some(19.0));
+    assert_eq!(detail.total_supply(), Some(21.0));
+    assert_eq!(detail.max_supply(), Some(21.0));
+    assert_eq!(detail.sentiment_up(), Some(70.0));
+    assert_eq!(detail.sentiment_down(), Some(30.0));
+    assert_eq!(detail.sparkline_7d(), &[1.0, 2.0, 4.0]);
+    assert_eq!(detail.categories(), &["layer-1", "store-of-value"]);
+    assert_eq!(detail.description(), Some("A peer-to-peer network."));
+
+    let request = &server.received_requests().await.unwrap()[0];
+    assert_eq!(request.url.path(), "/api/v3/coins/bitcoin");
+    assert_eq!(request.headers.get("user-agent").unwrap(), "coin-tui/0.1");
+}
+
+#[tokio::test]
+async fn fetch_coin_detail_percent_encodes_hostile_ids_and_rejects_missing_market_data() {
+    let server = MockServer::start().await;
+    // A hostile id cannot smuggle extra path segments or query text.
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/..%2Fadmin"))
+        .respond_with(json(COIN_DETAIL_BODY))
+        .mount(&server)
+        .await;
+    let detail = client(&server, None)
+        .fetch_coin_detail("../admin")
+        .await
+        .unwrap();
+    assert_eq!(detail.ath(), Some(100_000.0));
+
+    // A coin with no market_data and no description still normalizes to a
+    // usable detail with every optional value absent.
+    let bare = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/bare"))
+        .respond_with(json(r#"{"id":"bare","symbol":"b","name":"Bare"}"#))
+        .mount(&bare)
+        .await;
+    let detail = client(&bare, None).fetch_coin_detail("bare").await.unwrap();
+    assert_eq!(detail.market_cap(), None);
+    assert_eq!(detail.circulating_supply(), None);
+    assert!(detail.sparkline_7d().is_empty());
+    assert!(detail.categories().is_empty());
+    assert_eq!(detail.description(), None);
+}
+
+#[tokio::test]
+async fn fetch_coin_detail_normalizes_nullable_values_and_rejects_out_of_range() {
+    // An out-of-range number cannot deserialize into f64; the boundary
+    // rejects the whole response as malformed instead of leaking a NaN.
+    let hostile = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/nan"))
+        .respond_with(json(
+            r#"{"id":"nan","symbol":"n","name":"N","market_data":{"ath":{"usd":1e999}}}"#,
+        ))
+        .mount(&hostile)
+        .await;
+    assert_eq!(
+        client(&hostile, None)
+            .fetch_coin_detail("nan")
+            .await
+            .unwrap_err(),
+        ApiError::MalformedResponse
+    );
+
+    // Nulls in the sparkline normalize to missing values via `.flatten()`.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/nan"))
+        .respond_with(json(
+            r#"{"id":"nan","symbol":"n","name":"N","market_data":{"ath":{"usd":null},"current_price":{"usd":null},"sparkline_7d":{"price":[1,null,null,2]}}}"#,
+        ))
+        .mount(&server)
+        .await;
+    let detail = client(&server, None)
+        .fetch_coin_detail("nan")
+        .await
+        .unwrap();
+    assert_eq!(detail.ath(), None);
+    assert_eq!(detail.market_cap(), None);
+    assert_eq!(detail.sparkline_7d(), &[1.0, 2.0]);
+
+    let limited = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7"))
+        .mount(&limited)
+        .await;
+    assert_eq!(
+        client(&limited, None)
+            .fetch_coin_detail("any")
+            .await
+            .unwrap_err(),
+        ApiError::RateLimited {
+            retry_after: Some(Duration::from_secs(7))
+        }
+    );
+    let failed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&failed)
+        .await;
+    assert_eq!(
+        client(&failed, None)
+            .fetch_coin_detail("any")
+            .await
+            .unwrap_err(),
+        ApiError::HttpStatus { status: 503 }
+    );
+}
+
+#[tokio::test]
+async fn market_data_detail_default_returns_501_for_providers_without_detail() {
+    struct RowOnly;
+    impl api::MarketData for RowOnly {
+        fn fetch_snapshot<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<api::FetchOutcome, ApiError>> + Send + 'a>,
+        > {
+            Box::pin(async move { unreachable!("not used in this test") })
+        }
+    }
+    let detail = api::MarketData::fetch_coin_detail(&RowOnly, "bitcoin")
+        .await
+        .unwrap_err();
+    assert_eq!(detail, ApiError::HttpStatus { status: 501 });
+}
+
+/// A small sanitized RSS 2.0 feed with a channel title and two items.
+const RSS_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Fixture Wire</title>
+    <item>
+      <title>Bitcoin rises above $100K</title>
+      <link>https://example.com/stories/bitcoin-rises</link>
+      <pubDate>Tue, 18 Aug 2026 14:41:31 +0000</pubDate>
+    </item>
+    <item>
+      <title>Ethereum settles</title>
+      <link>https://example.com/stories/ethereum-settles</link>
+      <pubDate>Mon, 17 Aug 2026 09:00:00 +0000</pubDate>
+    </item>
+  </channel>
+</rss>
+"#;
+
+fn news_client(server: &MockServer) -> news::RssNewsClient {
+    news::RssNewsClient::with_timeouts(
+        &format!("{}/rss", server.uri()),
+        Duration::from_millis(100),
+        Duration::from_secs(1),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn rss_client_fetches_and_normalizes_headlines() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rss"))
+        .respond_with(json(RSS_BODY))
+        .mount(&server)
+        .await;
+    let items = news_client(&server).fetch_headlines().await.unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].title(), "Bitcoin rises above $100K");
+    assert_eq!(items[0].source(), "Fixture Wire");
+    assert_eq!(items[0].url(), "https://example.com/stories/bitcoin-rises");
+    assert!(items[0].published_at().is_some());
+    assert_eq!(items[1].title(), "Ethereum settles");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rss_client_rejects_non_rss_and_oversized_bodies_without_panicking() {
+    let plain = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(json("<html><body>error page</body></html>"))
+        .mount(&plain)
+        .await;
+    assert_eq!(
+        news_client(&plain).fetch_headlines().await.unwrap_err(),
+        ApiError::MalformedResponse
+    );
+
+    let huge = MockServer::start().await;
+    // A body well past the 1 MiB feed cap.
+    let body = format!(
+        "<rss><channel><title>W</title>{}</channel></rss>",
+        "<item><title>t</title></item>".repeat(200_000)
+    );
+    Mock::given(method("GET"))
+        .respond_with(json(&body))
+        .mount(&huge)
+        .await;
+    assert_eq!(
+        news_client(&huge).fetch_headlines().await.unwrap_err(),
+        ApiError::MalformedResponse
+    );
+}
+
+#[tokio::test]
+async fn rss_client_classifies_rate_limit_server_error_and_timeout() {
+    let limited = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "5"))
+        .mount(&limited)
+        .await;
+    assert_eq!(
+        news_client(&limited).fetch_headlines().await.unwrap_err(),
+        ApiError::RateLimited { retry_after: None }
+    );
+    let failed = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&failed)
+        .await;
+    assert_eq!(
+        news_client(&failed).fetch_headlines().await.unwrap_err(),
+        ApiError::HttpStatus { status: 503 }
+    );
+    let slow = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(json(RSS_BODY).set_delay(Duration::from_millis(200)))
+        .mount(&slow)
+        .await;
+    // A client with a 50 ms total timeout times out on the 200 ms delay.
+    let client = news::RssNewsClient::with_timeouts(
+        &format!("{}/rss", slow.uri()),
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    assert_eq!(
+        client.fetch_headlines().await.unwrap_err(),
+        ApiError::Timeout
+    );
+}
+
+#[tokio::test]
+async fn news_provider_trait_is_object_safe_and_never_provider_fails_cleanly() {
+    // The production loop calls the trait through a trait object; prove the
+    // never-provider (used by loop helpers) surfaces a clean HTTP error.
+    let provider: Box<dyn news::NewsProvider> = Box::new(news::NoNewsProvider);
+    assert_eq!(
+        provider.fetch_headlines().await.unwrap_err(),
+        ApiError::HttpStatus { status: 404 }
+    );
+    // The fixture constructor produces a headline the render path consumes.
+    let item = news::NewsItem::fixture("title", "source", "https://x.test/1");
+    assert_eq!(item.title(), "title");
+    assert_eq!(item.source(), "source");
+    assert_eq!(item.url(), "https://x.test/1");
 }

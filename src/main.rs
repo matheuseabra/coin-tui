@@ -4,6 +4,7 @@ mod config;
 mod domain;
 mod format;
 mod log;
+mod news;
 mod theme;
 mod tui;
 mod ui;

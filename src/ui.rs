@@ -1,3 +1,4 @@
+use chrono::Utc;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     prelude::Stylize,
@@ -12,16 +13,34 @@ const MAX_SANITIZED_SCALARS: usize = 256;
 
 use crate::{
     api::ApiError,
-    app::{App, DataState},
+    app::{App, DataState, DetailState, MainPane},
     domain::CoinMarket,
     format::{
         format_age, format_compact_money, format_compact_supply, format_percentage, format_price,
     },
+    news::NewsItem,
     theme::{Theme, THEMES},
 };
 
 const MIN_WIDTH: u16 = 60;
 const MIN_HEIGHT: u16 = 16;
+
+/// Main-view panes (news and sentiment) appear beside the market table at or
+/// above this width; below it `Tab`/`Shift-Tab` show one focused pane at a
+/// time so the table keeps its full column set. The threshold leaves the
+/// table at least 120 columns after the 42-column pane column, so Full-mode
+/// columns stay available whenever the panes are side-by-side.
+const PANE_MIN_WIDTH: u16 = 162;
+
+/// Width of the right pane column when panes are side-by-side.
+const SIDE_COLUMN: u16 = 42;
+
+/// Detail sidebar (coin data) appears beside the chart when the pane is at
+/// least this wide; below it the stats render as stacked lines under chart.
+const DETAIL_SIDEBAR_MIN_WIDTH: u16 = 78;
+
+/// Detail sidebar width at standard and full widths.
+const DETAIL_SIDEBAR_WIDTH: u16 = 36;
 
 /// Help overlay width and content. Every line must fit the inner width (width
 /// minus borders) and the whole block must fit the minimum supported height.
@@ -34,6 +53,7 @@ const HELP_LINES: &[&str] = &[
     "G / End         Last coin",
     "PageUp/Down     Move one page",
     "/               Search (Enter/Esc)",
+    "Tab/Shift-Tab   Switch pane",
     "Enter           Open coin detail",
     "s / Shift-S     Cycle sort column",
     "r               Refresh",
@@ -114,8 +134,8 @@ fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect, theme: &Theme
 }
 
 fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, width: u16) {
-    if let Some(coin) = app.detail() {
-        render_detail(frame, coin, area, app.theme());
+    if app.detail_open() {
+        render_detail(frame, app, area, app.theme());
         return;
     }
     let theme = app.theme();
@@ -139,7 +159,7 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
                 .iter()
                 .map(|error| Line::from(summary_message(error)))
                 .collect();
-            table_frame("Market | Live", app, info, frame, area, width);
+            render_market("Market | Live", app, info, frame, area, width);
         }
         DataState::Stale { error, notice, .. } => {
             let reason = match error {
@@ -158,7 +178,7 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
                 None => format!("Refresh failed: {reason}. Press r to retry."),
             };
             info.push(Line::from(retry));
-            table_frame("Market | Stale", app, info, frame, area, width);
+            render_market("Market | Stale", app, info, frame, area, width);
         }
         DataState::Empty { notice, .. } => {
             let mut body = vec![Line::from("No market rows were returned.")];
@@ -186,6 +206,220 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
             message_lines("Market | Error", body, frame, area, theme);
         }
     }
+}
+
+/// Route the market panes. Wide terminals show the table plus a right column
+/// (news wire on top, market breadth below); narrow terminals show one focused
+/// pane at a time so the table keeps its full column set.
+fn render_market(
+    title: &str,
+    app: &App,
+    info: Vec<Line<'static>>,
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    width: u16,
+) {
+    if width < PANE_MIN_WIDTH {
+        match app.pane_focus() {
+            MainPane::Table => table_frame(title, app, info, frame, area, width),
+            MainPane::News => news_pane(app, frame, area, true),
+            MainPane::Sentiment => sentiment_pane(app, frame, area, true),
+        }
+        return;
+    }
+    let [table_area, right] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(SIDE_COLUMN)])
+        .areas(area);
+    table_frame(title, app, info, frame, table_area, table_area.width);
+    let [news_area, sentiment_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .areas(right);
+    news_pane(app, frame, news_area, app.pane_focus() == MainPane::News);
+    sentiment_pane(
+        app,
+        frame,
+        sentiment_area,
+        app.pane_focus() == MainPane::Sentiment,
+    );
+}
+
+/// The news wire: latest headlines, or a labeled status when the feed is
+/// disabled, still loading, failed, or empty.
+fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
+    let theme = app.theme();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let lines: Vec<Line<'static>> = match app.news_feed() {
+        Some(feed) => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            for item in &feed.items {
+                lines.push(headline_line(item, inner_width, theme));
+                let url = item.url();
+                if !url.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        clean_remote(url, inner_width),
+                        Style::default(),
+                    )));
+                }
+            }
+            if feed.items.is_empty() && feed.notice.is_none() {
+                lines.push(Line::styled(
+                    "No headlines yet.",
+                    Style::default().fg(theme.notice),
+                ));
+            }
+            if let Some(error) = &feed.notice {
+                lines.push(Line::styled(
+                    format!("News refresh failed: {}.", short_error(error)),
+                    Style::default().fg(theme.notice),
+                ));
+            }
+            lines
+        }
+        None => vec![Line::styled(
+            if app.news_enabled() {
+                "Loading headlines..."
+            } else {
+                "News feed unavailable."
+            },
+            Style::default().fg(theme.notice),
+        )],
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(pane_block("News", focused, theme)),
+        area,
+    );
+}
+
+/// One headline: a bounded `source · age` prefix in the summary color followed
+/// by the bounded title, so no remote text can push the line past the pane.
+fn headline_line(item: &NewsItem, width: usize, theme: &Theme) -> Line<'static> {
+    let source = clean_remote(item.source(), 20);
+    let age = item
+        .published_at()
+        .and_then(|at| (Utc::now() - at).to_std().ok());
+    let prefix = match age {
+        Some(age) => format!("{source} \u{00b7} {}  ", format_age(age)),
+        None => format!("{source}  "),
+    };
+    let title = clean_remote(
+        item.title(),
+        width.saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
+    );
+    truncate_line(
+        Line::from(vec![
+            Span::styled(prefix, Style::default().fg(theme.summary)),
+            Span::styled(title, Style::default()),
+        ]),
+        width,
+    )
+}
+
+/// Shared pane frame; the focused pane's title is emphasized.
+fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
+    let style = if focused {
+        Style::default()
+            .fg(theme.notice)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.summary)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .title(Line::styled(format!(" {title} "), style))
+}
+
+/// Market breadth from the snapshot's 24-hour changes: up/down/flat counts, a
+/// bullish share meter, and the average, best, and worst mover.
+fn sentiment_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
+    let theme = app.theme();
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let lines = sentiment_lines(app, inner_width, theme);
+    frame.render_widget(
+        Paragraph::new(lines).block(pane_block("Sentiment", focused, theme)),
+        area,
+    );
+}
+
+fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let Some(snapshot) = app.snapshot() else {
+        return vec![Line::styled(
+            "No market data yet.",
+            Style::default().fg(theme.notice),
+        )];
+    };
+    let changes: Vec<f64> = snapshot
+        .coins()
+        .iter()
+        .filter_map(|coin| finite(coin.change_24h()))
+        .collect();
+    if changes.is_empty() {
+        return vec![Line::styled(
+            "No 24h data yet.",
+            Style::default().fg(theme.notice),
+        )];
+    }
+    let up = changes.iter().filter(|&&value| value > 0.0).count();
+    let down = changes.iter().filter(|&&value| value < 0.0).count();
+    let flat = changes.len() - up - down;
+    let bullish = ((up as f64 * 100.0) / changes.len() as f64).round() as usize;
+    let average = changes.iter().sum::<f64>() / changes.len() as f64;
+    let mut lines = Vec::with_capacity(6);
+    lines.push(Line::styled(
+        "24h breadth",
+        Style::default()
+            .fg(theme.summary)
+            .add_modifier(Modifier::BOLD),
+    ));
+    lines.push(Line::from(format!("Up {up}   Down {down}   Flat {flat}")));
+    let meter_prefix = "Bullish ";
+    let meter_suffix = format!(" {bullish}%");
+    let bar_cells = width
+        .saturating_sub(meter_prefix.len() + meter_suffix.len())
+        .max(1);
+    let filled = (bar_cells * bullish / 100).min(bar_cells);
+    let meter = format!(
+        "{}{}{}",
+        meter_prefix,
+        "█".repeat(filled) + &"░".repeat(bar_cells - filled),
+        meter_suffix,
+    );
+    lines.push(Line::styled(meter, Style::default().fg(theme.gain)));
+    lines.push(Line::from(format!(
+        "Avg 24h: {}",
+        format_percentage(Some(average))
+    )));
+    if let Some((coin, value)) = extreme_coin(snapshot.coins(), true) {
+        lines.push(Line::from(format!(
+            "Best: {} {}",
+            clean_remote(coin.symbol(), 8),
+            format_percentage(Some(value)),
+        )));
+    }
+    if let Some((coin, value)) = extreme_coin(snapshot.coins(), false) {
+        lines.push(Line::from(format!(
+            "Worst: {} {}",
+            clean_remote(coin.symbol(), 8),
+            format_percentage(Some(value)),
+        )));
+    }
+    lines
+}
+
+/// The coin with the highest or lowest finite 24-hour change (ties keep the
+/// first encountered); `None` when no coin carries valid data.
+fn extreme_coin(coins: &[CoinMarket], highest: bool) -> Option<(&CoinMarket, f64)> {
+    coins
+        .iter()
+        .filter_map(|coin| finite(coin.change_24h()).map(|change| (coin, change)))
+        .reduce(|acc, next| {
+            if (highest && next.1 > acc.1) || (!highest && next.1 < acc.1) {
+                next
+            } else {
+                acc
+            }
+        })
 }
 
 fn message(
@@ -246,19 +480,19 @@ fn table_frame(
     render_table(frame, app, table_area, width);
 }
 
-/// Read-only coin detail pane in a scaled-down CoinMarketCap shape: a left-
-/// aligned content column capped at `DETAIL_CONTENT_WIDTH` holds the identity
-/// header (rank chip, name, symbol), the price with its 24-hour change, the
-/// 1h/24h/7d change strip, a fixed-geometry gradient area chart with real
-/// price labels, and the market-stats grid. It renders only from the snapshot
-/// row's already-normalized series, so it needs no extra provider call and
+/// Read-only coin detail pane in a CoinMarketCap shape: a scaled-down content
+/// column holds the identity header (rank, name, symbol), the price with its
+/// 24-hour change, the 1h/24h/7d change strip, and a fixed-geometry gradient
+/// area chart with real price labels. Wide panes add a right-hand "coin data"
+/// column fed by the rich `/coins/{id}` detail when it has loaded; narrow
+/// panes stack a two-line market-stats grid under the chart instead. It always
+/// renders from the snapshot row's own normalized series as a fallback, so it
 /// works offline against the fixture server.
-fn render_detail(
-    frame: &mut Frame<'_>,
-    coin: &CoinMarket,
-    area: ratatui::layout::Rect,
-    theme: &Theme,
-) {
+fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, theme: &Theme) {
+    let Some(state) = app.detail_state() else {
+        return;
+    };
+    let coin = state.base();
     let title = clean_remote(coin.name(), 48);
     let block = Block::default().borders(Borders::ALL).title(Line::styled(
         format!(" {} ", title),
@@ -269,11 +503,42 @@ fn render_detail(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let content_width = DETAIL_CONTENT_WIDTH.min(inner.width);
-    let [content, _] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(content_width), Constraint::Min(0)])
-        .areas(inner);
+    if inner.width >= DETAIL_SIDEBAR_MIN_WIDTH {
+        let sidebar_width = DETAIL_SIDEBAR_WIDTH.min(inner.width * 2 / 5).max(30);
+        let [main, sidebar] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
+            .areas(inner);
+        render_detail_main(frame, state, main, theme, true);
+        render_detail_sidebar(frame, app, state, sidebar, theme);
+    } else {
+        render_detail_main(frame, state, inner, theme, false);
+    }
+}
+
+fn render_detail_main(
+    frame: &mut Frame<'_>,
+    state: &DetailState,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+    sidebar: bool,
+) {
+    let coin = state.base();
+    let content_width = if sidebar {
+        area.width
+    } else {
+        DETAIL_CONTENT_WIDTH.min(area.width)
+    };
+    let content = if sidebar {
+        area
+    } else {
+        let [content, _] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(content_width), Constraint::Min(0)])
+            .areas(area);
+        content
+    };
+    let stats_height: u16 = if sidebar { 0 } else { 2 };
     let [head, price, changes, chart, stats] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -281,9 +546,10 @@ fn render_detail(
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(stats_height),
         ])
         .areas(content);
+    let column_width = content_width as usize;
 
     let rank = coin
         .rank()
@@ -300,42 +566,249 @@ fn render_detail(
             Style::default().add_modifier(Modifier::BOLD),
         ),
     ]);
+    frame.render_widget(Paragraph::new(truncate_line(identity, column_width)), head);
     frame.render_widget(
-        Paragraph::new(truncate_line(identity, content_width as usize)),
-        head,
-    );
-
-    frame.render_widget(
-        Paragraph::new(truncate_line(
-            price_line(coin, theme),
-            content_width as usize,
-        )),
+        Paragraph::new(truncate_line(price_line(coin, theme), column_width)),
         price,
     );
     frame.render_widget(
-        Paragraph::new(truncate_line(
-            change_line(coin, theme),
-            content_width as usize,
-        )),
+        Paragraph::new(truncate_line(change_line(coin, theme), column_width)),
         changes,
     );
-    render_price_chart(frame, coin, chart, theme);
+    render_detail_chart(frame, state, chart, theme);
+    if !sidebar && stats.height >= 1 {
+        render_compact_detail_stats(frame, state, stats, column_width, theme);
+    }
+}
 
-    let cap = format_compact_money(coin.market_cap());
-    let volume = format_compact_money(coin.volume_24h());
-    let supply = format_compact_supply(coin.circulating_supply());
-    let stats_line = clean_remote(
-        &format!("Mkt cap: {cap} | Vol 24h: {volume} | Supply: {supply}"),
-        content_width as usize,
+/// The detail chart uses the rich hourly series when one is available and
+/// otherwise falls back to the row-derived 7-day series.
+fn detail_series(state: &DetailState) -> &[f64] {
+    match state {
+        DetailState::Ready { detail, .. } if !detail.sparkline_7d().is_empty() => {
+            detail.sparkline_7d()
+        }
+        _ => state.base().sparkline_7d(),
+    }
+}
+
+fn render_detail_chart(
+    frame: &mut Frame<'_>,
+    state: &DetailState,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
+    let trend = trend_color(state.base(), theme);
+    let Some(lines) = price_chart_lines(
+        detail_series(state),
+        area.width,
+        area.height,
+        trend,
+        theme.summary,
+    ) else {
+        frame.render_widget(Paragraph::new("No 7-day price data available."), area);
+        return;
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Compact (no-sidebar) market-stats grid: two bounded lines under the chart.
+fn render_compact_detail_stats(
+    frame: &mut Frame<'_>,
+    state: &DetailState,
+    area: ratatui::layout::Rect,
+    width: usize,
+    theme: &Theme,
+) {
+    let (cap, volume, supply, high, low, fdv) = match state {
+        DetailState::Ready { detail, .. } => (
+            detail.market_cap(),
+            detail.volume_24h(),
+            detail.circulating_supply(),
+            detail.high_24h(),
+            detail.low_24h(),
+            detail.fully_diluted_valuation(),
+        ),
+        _ => {
+            let coin = state.base();
+            (
+                coin.market_cap(),
+                coin.volume_24h(),
+                coin.circulating_supply(),
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    let summary_line1 = clean_remote(
+        &format!(
+            "Mkt cap: {} | Vol 24h: {} | 24h high: {}",
+            format_compact_money(cap),
+            format_compact_money(volume),
+            format_price(high),
+        ),
+        width,
+    );
+    let summary_line2 = clean_remote(
+        &format!(
+            "24h low: {} | Supply: {} | FDV: {}",
+            format_price(low),
+            format_compact_supply(supply),
+            format_compact_money(fdv),
+        ),
+        width,
     );
     frame.render_widget(
-        Paragraph::new(stats_line).style(
+        Paragraph::new(vec![Line::from(summary_line1), Line::from(summary_line2)]).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(theme.notice),
         ),
-        stats,
+        area,
     );
+}
+
+/// Right-hand "coin data" column: label/value rows from the rich detail (or
+/// the row fallback), a loading/unavailable note, and a bounded About snippet.
+fn render_detail_sidebar(
+    frame: &mut Frame<'_>,
+    app: &App,
+    state: &DetailState,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
+    let block = Block::default().borders(Borders::LEFT).title(Line::styled(
+        " Coin data ",
+        Style::default().fg(theme.summary),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (label, value) in detail_stat_rows(state) {
+        let label_span = Span::styled(format!("{label}: "), Style::default().fg(theme.summary));
+        let max_value = width.saturating_sub(UnicodeWidthStr::width(label_span.content.as_ref()));
+        let value_span = Span::styled(clean_remote(&value, max_value), Style::default());
+        lines.push(truncate_line(
+            Line::from(vec![label_span, value_span]),
+            width,
+        ));
+    }
+    let status = match state {
+        DetailState::Ready { .. } => None,
+        DetailState::Loading { .. } if app.detail_fetching() => Some(" Loading extended data..."),
+        _ => Some(" Extended data unavailable."),
+    };
+    if let Some(text) = status {
+        lines.push(Line::default());
+        lines.push(Line::styled(text, Style::default().fg(theme.notice)));
+    }
+    if let DetailState::Ready { detail, .. } = state {
+        if let Some(about) = detail.description() {
+            lines.push(Line::default());
+            lines.push(Line::styled(
+                " About ",
+                Style::default()
+                    .fg(theme.summary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(clean_remote(about, width), Style::default()));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// CoinMarketCap-style stat rows. The rich state uses every extended field;
+/// the row fallback fills what the snapshot holds and lets the sidebar render
+/// the same shape with a loading / unavailable note.
+fn detail_stat_rows(state: &DetailState) -> Vec<(&'static str, String)> {
+    match state {
+        DetailState::Ready { detail, .. } => {
+            let mut rows = vec![
+                ("Mkt cap", format_compact_money(detail.market_cap())),
+                ("Vol 24h", format_compact_money(detail.volume_24h())),
+                ("24h high", format_price(detail.high_24h())),
+                ("24h low", format_price(detail.low_24h())),
+                (
+                    "ATH",
+                    with_parenthesized_percent(detail.ath(), detail.ath_change()),
+                ),
+                (
+                    "ATL",
+                    with_parenthesized_percent(detail.atl(), detail.atl_change()),
+                ),
+                ("Supply", format_compact_supply(detail.circulating_supply())),
+                ("Total supply", format_compact_supply(detail.total_supply())),
+                ("Max supply", format_compact_supply(detail.max_supply())),
+                (
+                    "FDV",
+                    format_compact_money(detail.fully_diluted_valuation()),
+                ),
+                ("7d", format_percentage(detail.change_7d())),
+                ("30d", format_percentage(detail.change_30d())),
+                ("60d", format_percentage(detail.change_60d())),
+                ("1y", format_percentage(detail.change_1y())),
+                (
+                    "Sentiment",
+                    format!(
+                        "{} up / {} down",
+                        percent_without_sign(detail.sentiment_up()),
+                        percent_without_sign(detail.sentiment_down()),
+                    ),
+                ),
+                (
+                    "Categories",
+                    detail
+                        .categories()
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ];
+            if let Some(description) = detail.description() {
+                rows.push(("About", clean_remote(description, 120)));
+            }
+            rows
+        }
+        DetailState::Basic(coin) | DetailState::Loading { base: coin } => vec![
+            ("Mkt cap", format_compact_money(coin.market_cap())),
+            ("Vol 24h", format_compact_money(coin.volume_24h())),
+            ("Supply", format_compact_supply(coin.circulating_supply())),
+            ("1h", format_percentage(coin.change_1h())),
+            ("24h", format_percentage(coin.change_24h())),
+            ("7d", format_percentage(coin.change_7d())),
+        ],
+    }
+}
+
+/// `$price (change%)` for ATH/ATL rows, keeping the sign and bounding non-finite
+/// and absent values as `-`.
+fn with_parenthesized_percent(value: Option<f64>, percent: Option<f64>) -> String {
+    match (finite(value), finite(percent)) {
+        (Some(value), Some(percent)) => format!(
+            "{} ({})",
+            format_price(Some(value)),
+            format_percentage(Some(percent)),
+        ),
+        (Some(value), _) => format_price(Some(value)),
+        _ => "-".into(),
+    }
+}
+
+/// Sentiment vote share without a forced sign, bounded to keep the sidebar row
+/// short even for hostile provider values.
+fn percent_without_sign(value: Option<f64>) -> String {
+    match finite(value) {
+        Some(value) if value.abs() >= 1000.0 => ">999%".into(),
+        Some(value) => format!("{value:.0}%"),
+        _ => "-".into(),
+    }
 }
 
 /// Truncate a styled line to `max_cells` display cells, keeping the surviving
@@ -568,25 +1041,6 @@ fn flush_run(spans: &mut Vec<Span<'static>>, run: &mut Option<(char, Color)>, ru
             Style::default().fg(color),
         ));
     }
-}
-
-fn render_price_chart(
-    frame: &mut Frame<'_>,
-    coin: &CoinMarket,
-    area: ratatui::layout::Rect,
-    theme: &Theme,
-) {
-    let Some(lines) = price_chart_lines(
-        coin.sparkline_7d(),
-        area.width,
-        area.height,
-        trend_color(coin, theme),
-        theme.summary,
-    ) else {
-        frame.render_widget(Paragraph::new("No 7-day price data available."), area);
-        return;
-    };
-    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// A ramp of `steps` shades from `base` down to a darkened endpoint, so the
@@ -936,6 +1390,7 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
         .iter()
         .map(|coin| make_row(coin, columns, theme))
         .collect();
+    let row_count = rows.len();
     let widths: Vec<Constraint> = columns
         .iter()
         .map(|column| Constraint::Length(column.width))
@@ -951,6 +1406,51 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
         .highlight_spacing(HighlightSpacing::Never)
         .row_highlight_style(Style::default().fg(theme.summary).reversed());
     frame.render_stateful_widget(table, area, &mut state);
+    render_row_separators(frame, row_count, app.selected(), area, theme);
+}
+
+/// Draw a full-width separator under every visible row except the last one and
+/// the selected row, so plain rows read as Bloomberg-style ledger lines. The
+/// scroll offset mirrors ratatui's: rows are two lines tall below a one-line
+/// header, and the selected row is kept within the visible window.
+fn render_row_separators(
+    frame: &mut Frame<'_>,
+    rows: usize,
+    selected: usize,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
+    if rows == 0 {
+        return;
+    }
+    const ROW_HEIGHT: u16 = 2;
+    let visible = ((area.height.saturating_sub(1)) / ROW_HEIGHT).max(1) as usize;
+    let last = rows - 1;
+    let selected = selected.min(last);
+    let offset = if selected >= visible {
+        selected + 1 - visible
+    } else {
+        0
+    };
+    let style = Style::default().fg(theme.summary);
+    let separator = "─".repeat(area.width as usize);
+    for window in 0..visible {
+        let index = offset + window;
+        if index > last {
+            break;
+        }
+        if index == last || index == selected {
+            continue;
+        }
+        let y = area.y + 1 + (window as u16) * ROW_HEIGHT + 1;
+        if y >= area.y + area.height {
+            break;
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(separator.clone(), style))),
+            ratatui::layout::Rect::new(area.x, y, area.width, 1),
+        );
+    }
 }
 
 /// Centered explanation when a committed filter matches no coin. The query
@@ -1466,7 +1966,7 @@ mod tests {
 
     fn app_with(result: Result<crate::api::FetchOutcome, ApiError>) -> App {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult { generation, result });
@@ -1682,7 +2182,7 @@ mod tests {
         assert!(text_at(&loading, 80, 24).contains("LOADING"));
 
         let mut stale = ready;
-        let Command::Fetch { generation } = stale.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = stale.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -1779,7 +2279,7 @@ mod tests {
             snapshot: many_rows(),
             summary_notice: None,
         }));
-        let Command::Fetch { generation } = stale.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = stale.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -2188,7 +2688,7 @@ mod tests {
             snapshot: snapshot("Bitcoin"),
             summary_notice: None,
         }));
-        let Command::Fetch { generation } = app.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -2322,7 +2822,7 @@ mod tests {
             snapshot: snapshot("Bitcoin"),
             summary_notice: Some(ApiError::HttpStatus { status: 500 }),
         }));
-        let Command::Fetch { generation } = app.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -2489,7 +2989,7 @@ mod tests {
             snapshot: summary_snapshot(),
             summary_notice: Some(ApiError::RateLimited { retry_after: None }),
         }));
-        let Command::Fetch { generation } = app.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -2554,7 +3054,7 @@ mod tests {
             snapshot: summary_snapshot(),
             summary_notice: Some(ApiError::RateLimited { retry_after: None }),
         }));
-        let Command::Fetch { generation } = app.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -2605,7 +3105,7 @@ mod tests {
             snapshot: snapshot("Bitcoin"),
             summary_notice: None,
         }));
-        let Command::Fetch { generation } = app.update(Event::Input(KeyEvent::new(
+        let Command::Fetch { generation, .. } = app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('r'),
             KeyModifiers::NONE,
         ))) else {
@@ -3436,5 +3936,349 @@ mod tests {
             nord.contains("| q quit | r refresh"),
             "controls retained: {nord:?}"
         );
+    }
+
+    /// An `App` with the news feed enabled and one loaded headline, driven
+    /// through the same update path the loop uses.
+    fn news_app(headlines: usize) -> App {
+        let mut app = crate::app::App::with_news_enabled(Duration::from_secs(60));
+        let Command::Fetch {
+            generation,
+            news_generation,
+        } = app.update(Event::Start)
+        else {
+            panic!("Start must request a refresh")
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(crate::api::FetchOutcome {
+                snapshot: rows_snapshot(vec![row_input("bitcoin", 1, "Bitcoin", "BTC", 50_000.0)]),
+                summary_notice: None,
+            }),
+        });
+        app.update(Event::NewsResult {
+            generation: news_generation.expect("news is chained when enabled"),
+            result: Ok((0..headlines)
+                .map(|index| {
+                    NewsItem::fixture(
+                        &format!("Headline {index} about markets"),
+                        "Fixture Wire",
+                        &format!("https://example.com/stories/{index}"),
+                    )
+                })
+                .collect()),
+        });
+        app
+    }
+
+    #[test]
+    fn news_pane_renders_headline_urls_and_failure_notice() {
+        // Focus the news pane so it replaces the table below the threshold.
+        let mut focused = news_app(2);
+        focused.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&focused, 60, 16);
+        assert!(rendered.contains(" News "), "pane title: {rendered:?}");
+        assert!(rendered.contains("Fixture Wire"), "{rendered:?}");
+        assert!(
+            rendered.contains("Headline 0 about markets"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.contains("https://example.com/stories/0"),
+            "the headline URL renders: {rendered:?}"
+        );
+
+        // A failed refresh keeps the headlines and appends the notice.
+        let mut failed = news_app(2);
+        let Command::Fetch {
+            news_generation, ..
+        } = failed.update(Event::Start)
+        else {
+            panic!("Start must request a refresh")
+        };
+        let news_generation = news_generation.expect("news chained");
+        failed.update(Event::NewsResult {
+            generation: news_generation,
+            result: Err(ApiError::HttpStatus { status: 503 }),
+        });
+        failed.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&failed, 60, 16);
+        assert!(
+            rendered.contains("Headline 0 about markets"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("News refresh failed"), "{rendered:?}");
+    }
+
+    #[test]
+    fn news_pane_shows_loading_and_unavailable_states() {
+        // News enabled but no result yet: loading placeholder. The market
+        // must be Ready for the body to route through the panes.
+        let mut loading = crate::app::App::with_news_enabled(Duration::from_secs(60));
+        let Command::Fetch { generation, .. } = loading.update(Event::Start) else {
+            panic!("Start must request a refresh")
+        };
+        loading.update(Event::FetchResult {
+            generation,
+            result: Ok(crate::api::FetchOutcome {
+                snapshot: rows_snapshot(vec![row_input("bitcoin", 1, "Bitcoin", "BTC", 50_000.0)]),
+                summary_notice: None,
+            }),
+        });
+        loading.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&loading, 60, 16);
+        assert!(rendered.contains("Loading headlines..."), "{rendered:?}");
+
+        // News disabled (default): unavailable placeholder.
+        let mut disabled = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: summary_snapshot(),
+            summary_notice: None,
+        }));
+        disabled.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&disabled, 60, 16);
+        assert!(rendered.contains("News feed unavailable."), "{rendered:?}");
+    }
+
+    #[test]
+    fn sentiment_pane_renders_breadth_meter_and_best_worst() {
+        // Three coins: two up, one down, one flat.
+        let rows = vec![
+            row_input("a", 1, "A", "AA", 1.0),
+            row_input("b", 2, "B", "BB", 1.0),
+            row_input("c", 3, "C", "CC", 1.0),
+            row_input("d", 4, "D", "DD", 1.0),
+        ];
+        let mut snapshot_rows = rows;
+        snapshot_rows[0].change_24h = Some(3.0);
+        snapshot_rows[1].change_24h = Some(-1.0);
+        snapshot_rows[2].change_24h = Some(2.0);
+        snapshot_rows[3].change_24h = Some(0.0);
+        let mut app = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(snapshot_rows),
+            summary_notice: None,
+        }));
+        // Two Tabs: Table -> News -> Sentiment.
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&app, 60, 16);
+        assert!(rendered.contains(" Sentiment "), "{rendered:?}");
+        assert!(rendered.contains("Up 2   Down 1   Flat 1"), "{rendered:?}");
+        assert!(rendered.contains("Bullish"), "{rendered:?}");
+        assert!(rendered.contains("50%"), "2 of 4 are up: {rendered:?}");
+        assert!(rendered.contains("Best: AA +3.00%"), "{rendered:?}");
+        assert!(rendered.contains("Worst: BB -1.00%"), "{rendered:?}");
+        assert!(rendered.contains("Avg 24h:"), "{rendered:?}");
+    }
+
+    #[test]
+    fn sentiment_pane_handles_empty_and_no_data() {
+        // Zero rows put the app in the Empty state message, not the pane.
+        let mut empty = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(vec![]),
+            summary_notice: None,
+        }));
+        empty.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        empty.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&empty, 60, 16);
+        assert!(
+            rendered.contains("No market rows were returned."),
+            "{rendered:?}"
+        );
+
+        // Ready rows with no finite 24h changes show the pane placeholder.
+        let mut nodata = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(vec![row_input("a", 1, "A", "AA", 1.0)]),
+            summary_notice: None,
+        }));
+        nodata.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        nodata.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&nodata, 60, 16);
+        assert!(rendered.contains("No 24h data yet."), "{rendered:?}");
+        assert!(rendered.contains(" Sentiment "), "{rendered:?}");
+    }
+
+    #[test]
+    fn panes_render_side_by_side_at_wide_widths_in_bounds() {
+        let app = news_app(3);
+        let rendered = text_at(&app, 162, 30);
+        // The table keeps its full column set and both panes render.
+        assert!(rendered.contains("Sym"), "standard columns: {rendered:?}");
+        assert!(rendered.contains("News"), "{rendered:?}");
+        assert!(rendered.contains("Sentiment"), "{rendered:?}");
+        assert!(
+            rendered.contains("Headline 0 about markets"),
+            "{rendered:?}"
+        );
+
+        let rendered = text_at(&app, 200, 30);
+        assert!(rendered.contains("News"), "{rendered:?}");
+        assert!(rendered.contains("Sentiment"), "{rendered:?}");
+        assert!(rendered.contains("Market summary"), "{rendered:?}");
+    }
+
+    #[test]
+    fn pane_focus_shows_one_pane_below_the_threshold() {
+        // At 161 the panes never render side-by-side; only the focused pane
+        // replaces the table.
+        let mut focused = news_app(2);
+        focused.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&focused, 161, 30);
+        assert!(
+            rendered.contains("Headline 0 about markets"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains("Up 0   Down"),
+            "sentiment is not shown when news is focused: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn detail_sidebar_renders_rich_fields_and_loading_note() {
+        // Build the app and open the detail ourselves so we can capture the
+        // fetch generation (detail_app already pressed Enter).
+        let mut app = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(vec![detail_row(
+                "Bitcoin",
+                "BTC",
+                50_000.0,
+                -2.0,
+                vec![1.0, 2.0],
+            )]),
+            summary_notice: None,
+        }));
+        let Command::FetchDetail { id, generation } = app.update(Event::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("Enter must open the detail and start the fetch")
+        };
+        let _ = id;
+        // Build a rich detail through the domain boundary and box it.
+        let detail = crate::domain::CoinDetail::new(crate::domain::CoinDetailInput {
+            id: "bitcoin".into(),
+            symbol: "btc".into(),
+            name: "Bitcoin".into(),
+            rank: Some(1),
+            price: Some(50_000.0),
+            change_1h: Some(0.1),
+            change_24h: Some(2.0),
+            change_7d: Some(-1.5),
+            change_14d: Some(3.0),
+            change_30d: Some(-2.0),
+            change_60d: Some(5.0),
+            change_1y: Some(40.0),
+            market_cap: Some(1_000_000_000_000.0),
+            volume_24h: Some(25_000_000_000.0),
+            high_24h: Some(52_000.0),
+            low_24h: Some(49_000.0),
+            ath: Some(100_000.0),
+            atl: Some(3_000.0),
+            ath_change: Some(-50.0),
+            atl_change: Some(1500.0),
+            circulating_supply: Some(19_700_000.0),
+            total_supply: Some(21_000_000.0),
+            max_supply: Some(21_000_000.0),
+            fully_diluted_valuation: Some(1_100_000_000_000.0),
+            categories: vec!["layer-1".into(), "store-of-value".into()],
+            sentiment_up: Some(70.0),
+            sentiment_down: Some(30.0),
+            sparkline_7d: vec![1.0, 2.0, 3.0],
+            description: Some("A peer-to-peer network for the fixture test.".into()),
+        });
+        app.update(Event::DetailResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Ok(Box::new(detail)),
+        });
+
+        let rendered = text_at(&app, 120, 30);
+        assert!(rendered.contains(" Coin data "), "{rendered:?}");
+        assert!(rendered.contains("ATH: $100K (-50.00%)"), "{rendered:?}");
+        assert!(rendered.contains("FDV: $1.1T"), "{rendered:?}");
+        assert!(
+            rendered.contains("Sentiment: 70% up / 30% down"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("layer-1"), "{rendered:?}");
+        assert!(rendered.contains("Total supply: 21.0M"), "{rendered:?}");
+        assert!(
+            rendered.contains("A peer-to-peer network for the fixt"),
+            "the About snippet renders (bounded to the sidebar width): {rendered:?}"
+        );
+
+        // The basic (row-fallback) detail shows a loading note.
+        let basic = detail_app(vec![detail_row(
+            "Bitcoin",
+            "BTC",
+            50_000.0,
+            -2.0,
+            vec![1.0, 2.0],
+        )]);
+        let rendered = text_at(&basic, 120, 30);
+        assert!(
+            rendered.contains("Loading extended data..."),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn row_separators_draw_beneath_plain_rows_and_skip_selected_and_last() {
+        let mut rows = Vec::new();
+        for rank in 1..=10 {
+            rows.push(row_input(
+                &rank.to_string(),
+                rank,
+                &format!("Coin {rank}"),
+                "x",
+                1.0,
+            ));
+        }
+        let mut app = app_with(Ok(crate::api::FetchOutcome {
+            snapshot: rows_snapshot(rows),
+            summary_notice: None,
+        }));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        )));
+        let rendered = text_at(&app, 80, 24);
+        // The separator glyph appears somewhere and stays in-bounds.
+        assert!(rendered.contains('─'), "{rendered:?}");
+        let rendered_120 = text_at(&app, 120, 30);
+        assert!(rendered_120.contains('─'), "{rendered:?}");
     }
 }

@@ -9,6 +9,8 @@ It shows a compact global market summary and up to 100 coins ranked by market ca
 - Global market summary: market cap, 24-hour volume, BTC dominance, 24-hour change
 - 100 coins by market cap with price, changes, cap, volume, supply, and sparkline
 - Keyboard navigation, stable sorting, case-insensitive search, manual refresh
+- A read-only coin detail screen with a gradient 7-day chart and a rich data sidebar
+- News and sentiment panes, cycled with `Tab`/`Shift-Tab`
 - Responsive layouts (compact, standard, full) and an explicit status for every state
 - USD-only quotes; works with or without color and at low resolution
 - Configurable via flags or environment variables; zero secrets outside your terminal
@@ -111,9 +113,14 @@ Raw HTTP is allowed only for loopback hosts, so the fixture is safe by construct
 | `Esc` | Cancel search or close help. |
 | `s`, `Shift-S` | Cycle the sort key forward or backward (rank, price, 1h, 24h, 7d, cap, volume, supply). |
 | `r` | Refresh now, unless a refresh is already running or cooling down. |
+| `Tab`, `Shift-Tab` | Cycle pane focus: market table, news, and sentiment. |
 | `?` | Toggle keybinding help. |
 
 Sorting is stable — selection stays on the same coin when possible, and missing values sort last. The status line shows the active sort key and direction; rank order is the default.
+
+## News and sentiment panes
+
+`Tab`/`Shift-Tab` move focus between the market table, a news wire, and a market-breadth sentiment pane. On terminals at least 162 columns wide the news and sentiment panes sit beside the table; below that the focused pane replaces the table so it keeps its full column set. The news pane shows bounded headlines (source, age, title, URL) from the configured RSS feed, and the sentiment pane shows the 24-hour up/down/flat counts, a bullish meter, and the best and worst mover. Pane keys are ignored while searching, while help is open, and on the coin detail screen.
 
 ## Responsive layouts
 
@@ -122,6 +129,7 @@ Sorting is stable — selection stays on the same coin when possible, and missin
 | `< 80` columns | Compact: rank, symbol, price, and 24-hour change. The summary becomes one status line and the sparkline is hidden. |
 | `80..119` columns | Standard: name, symbol, price, 1h, 24h, 7d, and market cap. |
 | `>= 120` columns | Full: standard columns plus volume, supply, and the sparkline. |
+| `>= 162` columns | Full table plus the news and sentiment panes in a right rail. |
 
 The minimum supported terminal is 60 columns by 16 rows. Below that, the app shows a centered resize message and keeps `q` working.
 
@@ -144,13 +152,14 @@ Data refreshes every 60 seconds while healthy. After a failure the app waits out
 
 ## Configuration
 
-All options are flags; `--base-url`, `--api-key`, and `--log-file` also read their environment variable, which the flag overrides.
+All options are flags; `--base-url`, `--news-url`, `--api-key`, and `--log-file` also read their environment variable, which the flag overrides.
 
 | Flag | Env | Default | Notes |
 | --- | --- | --- | --- |
 | `--refresh-seconds <N>` | — | `60` | Auto-refresh interval; minimum 15. |
 | `--currency <SYM>` | — | `usd` | Quote currency; the MVP supports USD only. |
 | `--base-url <URL>` | `COIN_TUI_BASE_URL` | `https://api.coingecko.com/` | Must be HTTPS, or plain HTTP to a loopback host (for mocks). No credentials in the URL. |
+| `--news-url <URL>` | `COIN_TUI_NEWS_URL` | `https://www.coindesk.com/arc/outboundfeeds/rss/` | RSS headline feed; same URL rules as `--base-url`. |
 | `--api-key <KEY>` | `COIN_TUI_API_KEY` | (none) | Sent as `x-cg-demo-api-key`. |
 | `--log-file <FILE>` | `COIN_TUI_LOG_FILE` | (none) | Appends redacted diagnostics to a file, off the screen. |
 
@@ -176,8 +185,8 @@ All options are flags; `--base-url`, `--api-key`, and `--log-file` also read the
 The first release is a read-only informational dashboard. It does not provide financial advice, and it deliberately excludes:
 
 - trading, wallets, accounts, portfolios, and financial calculations;
-- news, AI features, alerts, sentiment, and token detail pages;
-- watchlist persistence, alternate currencies, providers, and themes;
+- alerts, prediction markets, and AI features;
+- watchlist persistence, alternate currencies, and providers;
 - an HTTP server, browser UI, remote daemon, and plugin API.
 
 The list is capped at 100 coins, quotes are USD only, and there is no mouse interaction by design.

@@ -37,6 +37,8 @@ Required layout sizes:
 | `119x30` | Standard upper boundary. |
 | `120x30` | Full lower boundary with sparkline. |
 
+The pane layout is additionally covered at `162x30` and `200x30` (side-by-side table + news + sentiment) and at `161x30` (focused-pane-only just below the threshold); these are rendering tests, not required sizes in the table above.
+
 Every user-facing state in `PRODUCT.md` needs a rendering or state-transition test. Color assertions must also prove a text or symbol communicates the same meaning.
 
 ### HTTP Boundary
@@ -69,7 +71,10 @@ Automate terminal setup logic where practical. Manually verify normal exit, `Ctr
 At each UI quality gate, run the keyboard-only path from `PRODUCT.md` with fixture-backed or live data. Also verify:
 
 - resize across compact, standard, and full modes;
-- open the coin detail screen at each width and confirm the left-aligned, width-limited gradient chart with real price labels, the price with its 24-hour change, and the market-stats grid stay inside the pane;
+- `Tab`/`Shift-Tab` cycle the news and sentiment panes: below 162 columns only the focused pane renders, at 162+ the panes sit beside the table, and the pane keys are swallowed while searching, while help is open, and on the detail screen;
+- the news pane shows headline source/age/title/URL lines, a loading placeholder before the first result, and a failure notice that keeps the last headlines;
+- the sentiment pane shows the up/down/flat counts, the bullish meter, and the best/worst mover, with placeholders when there are no rows or no finite 24-hour changes;
+- open the coin detail screen at each width and confirm the left-aligned, width-limited gradient chart with real price labels, the price with its 24-hour change, and the market-stats grid stay inside the pane; at wide panes the `Coin data` sidebar (ATH/ATL, supplies, FDV, sentiment, categories, About) renders and the pane upgrades from the row fallback when the rich `/coins/{id}` fetch lands, and falls back cleanly when it fails;
 - cycle every built-in theme (`t`/`Shift-T`) at each supported width and on the detail screen, with the active theme named in the status line when not default;
 - readable output with truecolor and `NO_COLOR=1`;
 - missing values, a flat sparkline, and long remote names;

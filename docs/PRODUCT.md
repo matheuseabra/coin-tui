@@ -24,7 +24,7 @@ The first release includes:
 - a ranked list of up to 100 coins by market capitalization;
 - price, 1-hour, 24-hour, and 7-day changes;
 - market cap, 24-hour volume, circulating supply, and a 7-day sparkline;
-- keyboard navigation, stable sorting, search, manual refresh, and responsive layouts;
+- keyboard navigation, stable sorting, search, manual refresh, news and sentiment panes, and responsive layouts;
 - explicit loading, live, refreshing, stale, empty, rate-limited, offline, and fatal states;
 - USD as the only quote currency.
 
@@ -33,7 +33,7 @@ The first release includes:
 The first release excludes:
 
 - trading, wallets, accounts, portfolios, and financial calculations;
-- news, AI features, alerts, sentiment, and prediction markets;
+- alerts and prediction markets (beyond the computed 24-hour breadth sentiment);
 - watchlist persistence, alternate currencies, and providers;
 - token image downloads and a mouse-first experience;
 - an HTTP server, browser UI, remote daemon, and plugin API;
@@ -80,13 +80,24 @@ The minimum supported terminal is 60 columns by 16 rows. Below that size, the pr
 | `s`, `Shift-S` | Cycle sort key forward or backward. |
 | `r` | Request a refresh unless one is active or cooling down. |
 | `t`, `Shift-T` | Cycle the color theme forward or backward. |
+| `Tab`, `Shift-Tab` | Move pane focus forward or backward between the market table, news, and sentiment panes. |
 | `?` | Toggle keybinding help. |
 
 ## Coin Detail
 
-`Enter` on a selected row opens a read-only detail screen for that coin. The screen keeps the market summary for context and replaces the table with a CoinMarketCap-shaped layout in a left-aligned, width-limited content column: an identity header (rank, name, symbol), the price with its color-coded 24-hour change, the 1h/24h/7d change strip, the 7-day gradient price chart with real price labels, and a market-stats grid (market cap, 24-hour volume, circulating supply). `Esc` returns to the table with the selection and viewport unchanged.
+`Enter` on a selected row opens a read-only detail screen for that coin. The screen keeps the market summary for context and replaces the table with a CoinMarketCap-shaped layout in a left-aligned, width-limited content column: an identity header (rank, name, symbol), the price with its color-coded 24-hour change, the 1h/24h/7d change strip, the 7-day gradient price chart with real price labels, and a market-stats grid. `Esc` returns to the table with the selection and viewport unchanged.
 
 The detail chart renders the 7-day price series already delivered by the markets snapshot; it makes no extra provider request and behaves the same when stale, offline, or offline-fixture-driven. The chart hugs the pane's left border at a fixed content width, so it never stretches with the terminal: it draws a half-block area line filled with a themed gradient that fades away from the line (gain for a rising trend, loss for a falling one, neutral otherwise), with the real price range labeled on the left and a `7 days: low → high` caption. A flat or hostile series renders as a bounded mid-line, an all-missing series shows a placeholder message, long series are downsampled to a fixed point budget, and the caption always shows the plotted price range. Color only reinforces the sign of each change; every value remains sign-prefixed text. While the detail screen is open, navigation, search, and sort keys are ignored; `r`, `?`, `q`, and `Esc` stay active.
+
+At wide panes the detail screen adds a right-hand `Coin data` column fed by the rich `/coins/{id}` endpoint: 24-hour high/low, ATH and ATL with their change, circulating/total/max supply, fully diluted valuation, 14d/30d/60d/1y changes (where the provider supplies them), community sentiment votes, categories, and a bounded About snippet from the provider description. The pane opens instantly from the snapshot row and upgrades when the fetch lands; if the fetch fails or the provider does not support detail, it stays on the row-derived fallback with an "extended data unavailable" note. At narrow panes the same extended fields render as two compact stat lines under the chart instead of a sidebar.
+
+## News And Sentiment Panes
+
+`Tab` and `Shift-Tab` move focus between three panes: the market table, a news wire, and a market-breadth sentiment pane. On terminals at least 162 columns wide the news and sentiment panes render beside the table (news on top, sentiment below) and focus only emphasizes the active pane's title; on narrower terminals one focused pane replaces the table at a time so the table keeps its full column set. Focus is keyboard-only and modal: pane keys are swallowed while searching, while help is open, or on the coin detail screen.
+
+The news pane shows the latest headlines from the configured RSS feed (`--news-url`, default CoinDesk). Each headline renders a bounded `source · age` prefix in the summary color, the bounded title, and the bounded URL on its own line, so remote text can never overflow the pane. Before the first result the pane shows a loading placeholder, after a failed refresh it keeps the last headlines and appends a one-line failure notice, and with the feed disabled it says the feed is unavailable.
+
+The sentiment pane computes 24-hour market breadth from the current snapshot: up/down/flat counts, a bullish-share meter, the average 24-hour change, and the best and worst mover. It needs no second provider; with no market rows or no finite 24-hour changes it shows a placeholder. News and sentiment are informational; news links are displayed, never opened.
 
 ## Themes
 

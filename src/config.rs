@@ -12,6 +12,9 @@ use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 pub const DEFAULT_REFRESH_SECONDS: u64 = 60;
 pub const MIN_REFRESH_SECONDS: u64 = 15;
 
+/// Default news feed: the CoinDesk crypto headline RSS, keyless and HTTPS.
+pub const DEFAULT_NEWS_URL: &str = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+
 /// Typed CLI surface. Flags documented by clap derive; env alternatives are
 /// listed on the same flag so `--help` is complete.
 #[derive(Debug, Clone, Parser)]
@@ -42,6 +45,15 @@ pub struct Cli {
     )]
     base_url: String,
 
+    /// News headline RSS feed URL. Alternative: env `COIN_TUI_NEWS_URL`.
+    #[arg(
+        long,
+        env = "COIN_TUI_NEWS_URL",
+        hide_env_values = true,
+        default_value = DEFAULT_NEWS_URL
+    )]
+    news_url: String,
+
     /// CoinGecko Demo API key, sent as `x-cg-demo-api-key`. Alternative: env
     /// `COIN_TUI_API_KEY`.
     #[arg(long, env = "COIN_TUI_API_KEY", hide_env_values = true)]
@@ -59,6 +71,7 @@ pub struct Config {
     pub refresh_seconds: u64,
     pub currency: String,
     pub base_url: String,
+    pub news_url: String,
     pub api_key: Option<String>,
     pub log_file: Option<String>,
 }
@@ -75,10 +88,12 @@ fn config_from_matches(matches: ArgMatches) -> Result<Config, String> {
     let cli = Cli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
     validate_sources(&matches)?;
     validate_base_url(&cli.base_url)?;
+    validate_base_url(&cli.news_url)?;
     Ok(Config {
         refresh_seconds: cli.refresh_seconds,
         currency: cli.currency,
         base_url: cli.base_url,
+        news_url: cli.news_url,
         api_key: cli.api_key,
         log_file: cli.log_file,
     })
@@ -87,6 +102,7 @@ fn config_from_matches(matches: ArgMatches) -> Result<Config, String> {
 fn validate_sources(matches: &clap::ArgMatches) -> Result<(), String> {
     for (id, flag, env_var) in [
         ("base_url", "--base-url", "COIN_TUI_BASE_URL"),
+        ("news_url", "--news-url", "COIN_TUI_NEWS_URL"),
         ("api_key", "--api-key", "COIN_TUI_API_KEY"),
         ("log_file", "--log-file", "COIN_TUI_LOG_FILE"),
     ] {
@@ -155,7 +171,12 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
-    const CONFIG_ENV: [&str; 3] = ["COIN_TUI_BASE_URL", "COIN_TUI_API_KEY", "COIN_TUI_LOG_FILE"];
+    const CONFIG_ENV: [&str; 4] = [
+        "COIN_TUI_BASE_URL",
+        "COIN_TUI_NEWS_URL",
+        "COIN_TUI_API_KEY",
+        "COIN_TUI_LOG_FILE",
+    ];
 
     struct EnvGuard {
         _lock: MutexGuard<'static, ()>,
@@ -197,6 +218,7 @@ mod tests {
         assert_eq!(cli.refresh_seconds, DEFAULT_REFRESH_SECONDS);
         assert_eq!(cli.currency, "usd");
         assert_eq!(cli.base_url, "https://api.coingecko.com/");
+        assert_eq!(cli.news_url, DEFAULT_NEWS_URL);
         assert_eq!(cli.api_key, None);
         assert_eq!(cli.log_file, None);
     }
@@ -210,6 +232,8 @@ mod tests {
             "--currency",
             "--base-url",
             "COIN_TUI_BASE_URL",
+            "--news-url",
+            "COIN_TUI_NEWS_URL",
             "--api-key",
             "COIN_TUI_API_KEY",
             "--log-file",

@@ -54,9 +54,21 @@ Refreshing a ready, empty, or stale state keeps the snapshot visible and sets `f
 
 ### Coin Detail Screen
 
-`Enter` on a selected row stores the selected `CoinMarket` clone in `App.detail`; `Esc` clears it. Opening and closing never touch `selected`, so the table's selection and viewport are preserved across the transition. While `detail` is set the input update is modal: navigation, search, and sort keys fall through to `Command::None`, while `r`, `?`, `q`, and `Esc` remain active. A successful refresh replaces the stored coin with the matching-ID row from the new snapshot, so the pane stays fresh without holding a second query to the provider.
+`Enter` on a selected row stores a clone of the selected `CoinMarket` in `App.detail` as `DetailState::Basic`; `Esc` clears it. Opening and closing never touch `selected`, so the table's selection and viewport are preserved across the transition. While `detail` is set the input update is modal: navigation, search, and sort keys fall through to `Command::None`, while `r`, `?`, `q`, and `Esc` remain active. A successful refresh replaces the stored coin's base row with the matching-ID row from the new snapshot, so the pane stays fresh without holding a second query to the provider.
 
-The detail view is a pure render of the existing snapshot row and follows the CoinMarketCap coin-detail shape: identity header, price with its 24-hour change, the 1h/24h/7d change strip, a fixed-geometry gradient area chart, and a market-stats grid — all inside a left-aligned content column capped at `DETAIL_CONTENT_WIDTH = 56`, so the page never stretches with the terminal and the chart hugs the pane's left border. The chart (`price_chart_lines`/`render_price_chart` in `ui.rs`) is drawn in code, with no chart dependency: the already-normalized `sparkline_7d` series is filtered, downsampled to at most `MAX_CHART_POINTS = 512`, and min-max normalized into `[0.0, 1.0]` (flat or overflow range falls back to a mid-line), then sampled at two-sub-row (half-block) resolution across at most `CHART_ROWS = 6` body rows and filled from the line down with a `GRADIENT_SHADES = 8` ramp that darkens away from the line; real price labels and the `7 days: low → high` caption use the summary accent. Normalization bounds the graph's row count, and the fixed content column bounds its width, so hostile, empty, overflowing, or gigantic series cannot panic or overflow the renderer, and it deliberately adds no provider endpoint.
+The detail screen follows the CoinMarketCap coin-detail shape: identity header, price with its 24-hour change, the 1h/24h/7d change strip, a fixed-geometry gradient area chart, and a market-stats grid — all inside a left-aligned content column capped at `DETAIL_CONTENT_WIDTH = 56`, so the page never stretches with the terminal and the chart hugs the pane's left border. The chart (`price_chart_lines`/`render_detail_chart` in `ui.rs`) is drawn in code, with no chart dependency: the already-normalized `sparkline_7d` series is filtered, downsampled to at most `MAX_CHART_POINTS = 512`, and min-max normalized into `[0.0, 1.0]` (flat or overflow range falls back to a mid-line), then sampled at two-sub-row (half-block) resolution across at most `CHART_ROWS = 6` body rows and filled from the line down with a `GRADIENT_SHADES = 8` ramp that darkens away from the line; real price labels and the `7 days: low → high` caption use the summary accent. Normalization bounds the graph's row count, and the fixed content column bounds its width, so hostile, empty, overflowing, or gigantic series cannot panic or overflow the renderer.
+
+#### Rich Detail Sidebar
+
+On top of the row-backed base, `Enter` starts an on-demand `GET /coins/{id}` fetch (`CoinGeckoClient::fetch_coin_detail` in `api.rs`, id percent-encoded via `coin_detail_url` so a hostile id cannot smuggle path segments). The `DetailState` transitions `Basic → Loading → Ready`, where `Loading` carries the base row and `Ready` carries the base row plus the rich `Box<CoinDetail>` (`Event::DetailResult` boxes the detail the same way to keep the event enum small). A failed fetch or a provider without detail support leaves the pane on `Basic`; a stale generation is ignored. Wide detail panes (`DETAIL_SIDEBAR_MIN_WIDTH = 78` inner columns) split into the main column plus a `Coin data` sidebar (`DETAIL_SIDEBAR_WIDTH = 36`) with ATH/ATL plus change, supplies, fully diluted valuation, longer-period changes, sentiment votes, categories, and a bounded About snippet; narrow panes stack the same values as two compact stat lines under the chart. The chart prefers the rich detail's dense hourly `sparkline_7d` series when present and falls back to the row series.
+
+#### News And Pane Layout
+
+`Tab`/`Shift-Tab` cycle `MainPane` (`Table`, `News`, `Sentiment`). Below `PANE_MIN_WIDTH = 162` the focused pane renders alone in the body so the table keeps its full column set; at 162+ a `SIDE_COLUMN = 42` right rail holds the news pane (top 55%) and the sentiment pane (bottom 45%) beside the table, and focus only emphasizes the active pane's title. Pane keys are swallowed while searching, while help is open, or on the detail screen.
+
+The news feed is a separate `NewsProvider` boundary (`src/news.rs`): `RssNewsClient` fetches the configured RSS URL with the same URL validation, no-redirect client, bounded 1 MiB body, and timeout rules as the market provider, and `parse_rss` normalizes items into bounded `NewsItem` values (title ≤ 220 scalars, source ≤ 28, url ≤ 300, control characters stripped, RFC-2822 dates parsed to UTC). An HTML error page cannot masquerade as an empty feed: a missing `<rss>`/`<feed>` root is `MalformedResponse`. The news fetch is chained onto a market refresh (`Command::Fetch { news_generation }`), one in flight at a time, generation-guarded like the market fetch, and spawned as its own cancellable task so a slow feed never blocks input, the market refresh, or shutdown. A failed news refresh preserves the last headlines and records the notice; the `NewsFeed` state is the newest items plus an optional `ApiError`.
+
+The sentiment pane is a pure render of the current snapshot: up/down/flat counts and a bullish meter over the finite 24-hour changes, plus average, best, and worst mover. It adds no provider call.
 
 ### Themes
 
@@ -69,11 +81,13 @@ Start with this structure and split further only when a file becomes difficult t
 ```text
 src/
 |-- main.rs          # process setup, error reporting, terminal lifetime
-|-- app.rs           # App, Event, Command, update, selection and sorting
+|-- app.rs           # App, Event, Command, update, selection, sorting, panes
 |-- tui.rs           # terminal enter/restore and Crossterm event stream
 |-- api.rs           # MarketData trait, CoinGecko client and DTO conversion
-|-- domain.rs        # provider-independent market types
+|-- domain.rs        # provider-independent market and detail types
+|-- news.rs          # NewsProvider trait, RSS client and bounded parsing
 |-- format.rs        # deterministic money, percentage and supply formatting
+|-- log.rs           # redacted file tracing
 |-- theme.rs         # built-in color themes as semantic roles
 `-- ui.rs            # responsive layout and Ratatui rendering
 tests/
@@ -131,12 +145,15 @@ Use CoinGecko's Demo API as the first provider:
 
 Use the global endpoint only when needed for summary metrics. Fetch independent endpoints concurrently, then publish one complete snapshot. `MarketData::fetch_snapshot` returns `Result<FetchOutcome, ApiError>`: a successful coin request publishes usable rows even when the optional summary request fails, with that `ApiError` in `summary_notice`; a clean summary has no notice. A failed coin request remains the outer error and fails the refresh. The application stores the optional notice in `Ready` or `Empty` and clears it on the next clean success; it does not schedule retries or cooldowns here.
 
+`MarketData::fetch_coin_detail` fetches the rich `/coins/{id}` payload on demand for the detail sidebar. The trait default returns `501 Not Implemented`, so providers that only serve the market snapshot leave the detail pane on its row-backed fallback; `CoinGeckoClient` overrides it. Detail values are normalized like market values at the boundary, and out-of-range or non-JSON responses are rejected as `MalformedResponse`.
+
 Configuration comes from environment variables and CLI flags:
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `COIN_TUI_API_KEY` | unset | CoinGecko Demo API key, sent as `x-cg-demo-api-key`. |
 | `COIN_TUI_BASE_URL` | CoinGecko Demo URL | Test or alternate compatible endpoint. |
+| `COIN_TUI_NEWS_URL` | CoinDesk RSS | News headline feed; same HTTPS/loopback rules as the base URL. |
 | `COIN_TUI_LOG_FILE` | unset | Append redacted diagnostics to this file; logs stay off the alternate screen. |
 | `--refresh-seconds` | `60` | Automatic refresh interval, minimum 15 seconds. |
 | `--currency` | `usd` | Quote currency; MVP accepts USD only and validates explicitly. |
@@ -154,7 +171,7 @@ When `COIN_TUI_LOG_FILE` is set, a shared `FileLog` (`src/log.rs`) appends times
 
 ### Performance Measurement
 
-The idle loop is event-driven: it parks on `tokio::select!` over input, fetch results, and a one-second tick, and re-renders only when an event arrives; it never draws at a fixed high frame rate. `scripts/fixture-server.py` is a loopback CoinGecko-compatible mock serving small sanitized JSON for offline manual runs, and `scripts/measure-idle.sh` samples the idle CPU of a release run and reports the traced render/refresh cadence. Nothing in `scripts/` is part of the application build; it is a measurement harness only. `TESTING.md` defines the measurement procedure.
+The idle loop is event-driven: it parks on `tokio::select!` over input, fetch results, and a one-second tick, and re-renders only when an event arrives; it never draws at a fixed high frame rate. `scripts/fixture-server.py` is a loopback CoinGecko-compatible mock serving small sanitized JSON for the market and rich-detail endpoints plus an RSS feed for offline manual runs, and `scripts/measure-idle.sh` samples the idle CPU of a release run and reports the traced render/refresh cadence. Nothing in `scripts/` is part of the application build; it is a measurement harness only. `TESTING.md` defines the measurement procedure.
 
 Provider verification and fixture rules are defined in `TESTING.md`.
 
@@ -176,6 +193,7 @@ Current production dependencies:
 | `url` | Parsed host validation for HTTPS and loopback-only HTTP base URLs. |
 | `unicode-width` | Measure terminal display-cell width when sanitizing and bounding remote text and compact rows. |
 | `clap` | Typed CLI flags and environment integration. |
+| `quick-xml` | Streaming RSS 2.0 feed parsing in `src/news.rs` (default features off, no network I/O). |
 
 Planned production dependencies are added only with the roadmap task that uses them:
 

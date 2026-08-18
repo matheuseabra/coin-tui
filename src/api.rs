@@ -6,10 +6,13 @@ use chrono::{DateTime, TimeZone, Utc};
 use reqwest::{header, redirect::Policy, StatusCode, Url};
 use serde::Deserialize;
 
-use crate::domain::{CoinMarketInput, MarketSnapshot, MarketSummaryInput};
+use crate::domain::{
+    CoinDetail, CoinDetailInput, CoinMarketInput, MarketSnapshot, MarketSummaryInput,
+};
 
 const MARKETS_PATH: &str = "api/v3/coins/markets";
 const GLOBAL_PATH: &str = "api/v3/global";
+const COINS_PATH: &str = "api/v3/coins";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,28 +83,14 @@ impl CoinGeckoClient {
         connect_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Self, ApiError> {
-        let base_url = Url::parse(base_url).map_err(|_| ApiError::InvalidBaseUrl)?;
-        let allowed_http =
-            base_url.scheme() == "http" && base_url.host().map(is_loopback_host).unwrap_or(false);
-        if base_url.scheme() != "https" && !allowed_http
-            || base_url.host_str().is_none()
-            || !base_url.username().is_empty()
-            || base_url.password().is_some()
-        {
-            return Err(ApiError::InvalidBaseUrl);
-        }
+        let base_url = validate_http_url(base_url)?;
         if tokio::time::Instant::now()
             .checked_add(total_timeout)
             .is_none()
         {
             return Err(ApiError::InvalidTimeoutConfiguration);
         }
-        let client = reqwest::Client::builder()
-            .user_agent("coin-tui/0.1")
-            .redirect(Policy::none())
-            .connect_timeout(connect_timeout)
-            .build()
-            .map_err(|_| ApiError::Transport)?;
+        let client = build_http_client(connect_timeout)?;
         Ok(Self {
             client,
             base_url,
@@ -125,6 +114,44 @@ impl CoinGeckoClient {
             )
             .await?;
         convert(coins)
+    }
+
+    /// Rich CoinMarketCap-shaped detail for one coin (`GET /coins/{id}`):
+    /// high/low, ATH/ATL, 14d/30d/60d/1y changes, supply totals, fully
+    /// diluted valuation, categories, community sentiment votes, a description
+    /// snippet, and a dense hourly 7-day sparkline.
+    pub async fn fetch_coin_detail(&self, id: &str) -> Result<CoinDetail, ApiError> {
+        let coin: CoinGeckoCoin = self
+            .request_url(
+                self.coin_detail_url(id)?,
+                &[
+                    ("localization", "false"),
+                    ("tickers", "false"),
+                    ("market_data", "true"),
+                    ("community_data", "false"),
+                    ("developer_data", "false"),
+                    ("sparkline", "true"),
+                    ("vs_currency", "usd"),
+                ],
+            )
+            .await?;
+        convert_detail(coin)
+    }
+
+    /// Percent-encode the coin id into a `/coins/{id}` URL so a hostile id
+    /// cannot smuggle extra path segments or query text into the request.
+    fn coin_detail_url(&self, id: &str) -> Result<Url, ApiError> {
+        let mut url = self
+            .base_url
+            .join(&format!("{COINS_PATH}/"))
+            .map_err(|_| ApiError::InvalidBaseUrl)?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|_| ApiError::InvalidBaseUrl)?;
+            segments.pop_if_empty().push(id);
+        }
+        Ok(url)
     }
 
     /// Fetch rows and the optional global summary as one concurrent snapshot.
@@ -184,6 +211,14 @@ impl CoinGeckoClient {
             .base_url
             .join(path)
             .map_err(|_| ApiError::InvalidBaseUrl)?;
+        self.request_url(url, query).await
+    }
+
+    async fn request_url<T: for<'de> Deserialize<'de>>(
+        &self,
+        url: Url,
+        query: &[(&str, &str)],
+    ) -> Result<T, ApiError> {
         let mut request = self.client.get(url).query(query);
         if let Some(key) = &self.api_key {
             request = request.header("x-cg-demo-api-key", key);
@@ -231,6 +266,15 @@ pub trait MarketData: Send + Sync {
     fn fetch_snapshot<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<FetchOutcome, ApiError>> + Send + 'a>>;
+
+    /// Rich detail for one coin. The default is unsupported: providers that
+    /// cannot serve it leave the app on the fallback row-based detail.
+    fn fetch_coin_detail<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CoinDetail, ApiError>> + Send + 'a>> {
+        Box::pin(async move { Err(ApiError::HttpStatus { status: 501 }) })
+    }
 }
 
 impl MarketData for CoinGeckoClient {
@@ -239,9 +283,42 @@ impl MarketData for CoinGeckoClient {
     ) -> Pin<Box<dyn Future<Output = Result<FetchOutcome, ApiError>> + Send + 'a>> {
         Box::pin(CoinGeckoClient::fetch_snapshot(self))
     }
+
+    fn fetch_coin_detail<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CoinDetail, ApiError>> + Send + 'a>> {
+        Box::pin(CoinGeckoClient::fetch_coin_detail(self, id))
+    }
 }
 
-fn classify_request_error(error: reqwest::Error) -> ApiError {
+/// Validate the shared HTTP URL rules: an absolute URL with a host, no
+/// credentials, and an HTTPS scheme (raw HTTP only for loopback hosts so a
+/// fixture server is usable offline).
+pub(crate) fn validate_http_url(raw: &str) -> Result<Url, ApiError> {
+    let url = Url::parse(raw).map_err(|_| ApiError::InvalidBaseUrl)?;
+    let allowed_http = url.scheme() == "http" && url.host().map(is_loopback_host).unwrap_or(false);
+    if url.scheme() != "https" && !allowed_http
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ApiError::InvalidBaseUrl);
+    }
+    Ok(url)
+}
+
+/// A no-redirect HTTP client with the shared user agent and connect timeout.
+pub(crate) fn build_http_client(connect_timeout: Duration) -> Result<reqwest::Client, ApiError> {
+    reqwest::Client::builder()
+        .user_agent("coin-tui/0.1")
+        .redirect(Policy::none())
+        .connect_timeout(connect_timeout)
+        .build()
+        .map_err(|_| ApiError::Transport)
+}
+
+pub(crate) fn classify_request_error(error: reqwest::Error) -> ApiError {
     if error.is_timeout() {
         ApiError::Timeout
     } else {
@@ -292,6 +369,128 @@ struct CoinGeckoMarket {
     circulating_supply: Option<f64>,
     sparkline_in_7d: Option<Sparkline>,
     last_updated: Option<String>,
+}
+
+/// `GET /coins/{id}` response: the top-level identity plus the rich
+/// `market_data` block that backs the CoinMarketCap-style sidebar.
+#[derive(Deserialize)]
+struct CoinGeckoCoin {
+    id: String,
+    symbol: String,
+    name: String,
+    market_cap_rank: Option<u32>,
+    categories: Option<Vec<String>>,
+    description: Option<CoinGeckoDescription>,
+    market_data: Option<CoinGeckoMarketData>,
+}
+
+#[derive(Default, Deserialize)]
+struct CoinGeckoDescription {
+    #[serde(default)]
+    en: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct CoinGeckoMarketData {
+    #[serde(default)]
+    current_price: Option<CurrencyValue>,
+    #[serde(default)]
+    market_cap: Option<CurrencyValue>,
+    #[serde(default)]
+    fully_diluted_valuation: Option<CurrencyValue>,
+    #[serde(default)]
+    total_volume: Option<CurrencyValue>,
+    #[serde(default)]
+    high_24h: Option<CurrencyValue>,
+    #[serde(default)]
+    low_24h: Option<CurrencyValue>,
+    #[serde(default)]
+    ath: Option<CurrencyValue>,
+    #[serde(default)]
+    atl: Option<CurrencyValue>,
+    #[serde(default)]
+    ath_change_percentage: Option<CurrencyValue>,
+    #[serde(default)]
+    atl_change_percentage: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_1h_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_24h: Option<f64>,
+    #[serde(default)]
+    price_change_percentage_7d_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_14d_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_30d_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_60d_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    price_change_percentage_1y_in_currency: Option<CurrencyValue>,
+    #[serde(default)]
+    circulating_supply: Option<f64>,
+    #[serde(default)]
+    total_supply: Option<f64>,
+    #[serde(default)]
+    max_supply: Option<f64>,
+    #[serde(default)]
+    sentiment_votes_up_percentage: Option<f64>,
+    #[serde(default)]
+    sentiment_votes_down_percentage: Option<f64>,
+    #[serde(default)]
+    sparkline_7d: Option<Sparkline>,
+}
+
+fn convert_detail(coin: CoinGeckoCoin) -> Result<CoinDetail, ApiError> {
+    let market = coin.market_data.unwrap_or_default();
+    Ok(CoinDetail::new(CoinDetailInput {
+        id: coin.id,
+        symbol: coin.symbol,
+        name: coin.name,
+        rank: coin.market_cap_rank,
+        price: market.current_price.and_then(|value| value.usd),
+        change_1h: market
+            .price_change_percentage_1h_in_currency
+            .and_then(|value| value.usd),
+        change_24h: market.price_change_percentage_24h,
+        change_7d: market
+            .price_change_percentage_7d_in_currency
+            .and_then(|value| value.usd),
+        change_14d: market
+            .price_change_percentage_14d_in_currency
+            .and_then(|value| value.usd),
+        change_30d: market
+            .price_change_percentage_30d_in_currency
+            .and_then(|value| value.usd),
+        change_60d: market
+            .price_change_percentage_60d_in_currency
+            .and_then(|value| value.usd),
+        change_1y: market
+            .price_change_percentage_1y_in_currency
+            .and_then(|value| value.usd),
+        market_cap: market.market_cap.and_then(|value| value.usd),
+        volume_24h: market.total_volume.and_then(|value| value.usd),
+        high_24h: market.high_24h.and_then(|value| value.usd),
+        low_24h: market.low_24h.and_then(|value| value.usd),
+        ath: market.ath.and_then(|value| value.usd),
+        atl: market.atl.and_then(|value| value.usd),
+        ath_change: market.ath_change_percentage.and_then(|value| value.usd),
+        atl_change: market.atl_change_percentage.and_then(|value| value.usd),
+        circulating_supply: market.circulating_supply,
+        total_supply: market.total_supply,
+        max_supply: market.max_supply,
+        fully_diluted_valuation: market.fully_diluted_valuation.and_then(|value| value.usd),
+        categories: coin.categories.unwrap_or_default(),
+        sentiment_up: market.sentiment_votes_up_percentage,
+        sentiment_down: market.sentiment_votes_down_percentage,
+        sparkline_7d: market
+            .sparkline_7d
+            .and_then(|value| value.price)
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect(),
+        description: coin.description.and_then(|description| description.en),
+    }))
 }
 
 #[derive(Deserialize)]

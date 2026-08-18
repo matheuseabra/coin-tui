@@ -13,11 +13,14 @@ use futures_util::{Stream, StreamExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::news::NoNewsProvider;
 use crate::{
     api::{ApiError, CoinGeckoClient, FetchOutcome, MarketData},
     config::Config,
-    domain::{CoinMarket, MarketSnapshot},
+    domain::{CoinDetail, CoinMarket, MarketSnapshot},
     log::FileLog,
+    news::{NewsItem, NewsProvider, RssNewsClient},
     theme::{Theme, THEMES},
     tui, ui,
 };
@@ -33,12 +36,28 @@ pub enum Event {
         generation: u64,
         result: Result<FetchOutcome, ApiError>,
     },
+    DetailResult {
+        id: String,
+        generation: u64,
+        result: Result<Box<CoinDetail>, ApiError>,
+    },
+    NewsResult {
+        generation: u64,
+        result: Result<Vec<NewsItem>, ApiError>,
+    },
 }
 
 pub enum Command {
     Quit,
     Render,
-    Fetch { generation: u64 },
+    Fetch {
+        generation: u64,
+        news_generation: Option<u64>,
+    },
+    FetchDetail {
+        id: String,
+        generation: u64,
+    },
     None,
 }
 
@@ -65,6 +84,58 @@ pub enum DataState {
     Fatal(ApiError),
 }
 
+/// The coin detail screen. `Enter` always opens with the snapshot row
+/// (`Basic`) so the pane renders instantly offline; an optional
+/// `/coins/{id}` fetch upgrades it to `Ready`, and a failed fetch keeps it
+/// on the row-derived fallback.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DetailState {
+    Basic(CoinMarket),
+    Loading {
+        base: CoinMarket,
+    },
+    Ready {
+        base: CoinMarket,
+        detail: Box<CoinDetail>,
+    },
+}
+
+impl DetailState {
+    pub fn base(&self) -> &CoinMarket {
+        match self {
+            DetailState::Basic(base)
+            | DetailState::Loading { base }
+            | DetailState::Ready { base, .. } => base,
+        }
+    }
+
+    fn update_base(&mut self, base: CoinMarket) {
+        match self {
+            DetailState::Basic(current)
+            | DetailState::Loading { base: current }
+            | DetailState::Ready { base: current, .. } => *current = base,
+        }
+    }
+}
+
+/// The newest headline feed plus the notice when the last fetch failed; the
+/// previous items are preserved so the pane shows stale news instead of blank.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewsFeed {
+    pub items: Vec<NewsItem>,
+    pub notice: Option<ApiError>,
+}
+
+/// Which pane the main view shows. At compact widths only the focused pane is
+/// visible (`Tab`/`Shift-Tab` cycle it); at wide widths the focused pane's
+/// title is highlighted but the market table, news, and sentiment all render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainPane {
+    Table,
+    News,
+    Sentiment,
+}
+
 pub struct App {
     state: DataState,
     generation: u64,
@@ -74,7 +145,15 @@ pub struct App {
     search: SearchState,
     sort: SortState,
     help_open: bool,
-    detail: Option<CoinMarket>,
+    detail: Option<DetailState>,
+    detail_fetching: bool,
+    detail_generation: u64,
+    detail_id: Option<String>,
+    news: Option<NewsFeed>,
+    news_fetching: bool,
+    news_generation: u64,
+    news_enabled: bool,
+    pane_focus: MainPane,
     theme_index: usize,
     schedule: RefreshScheduler,
 }
@@ -289,7 +368,19 @@ impl App {
     }
 
     /// An `App` whose automatic refresh cadence comes from validated config.
+    /// The news feed stays disabled; the production controller opts in.
+    #[cfg(test)]
     pub fn with_refresh_interval(interval: Duration) -> Self {
+        Self::with_news_flag(interval, false)
+    }
+
+    /// App with the news feed enabled.
+    #[cfg(test)]
+    pub fn with_news_enabled(interval: Duration) -> Self {
+        Self::with_news_flag(interval, true)
+    }
+
+    fn with_news_flag(interval: Duration, news_enabled: bool) -> Self {
         Self {
             state: DataState::Initial,
             generation: 0,
@@ -300,6 +391,14 @@ impl App {
             sort: SortState::default(),
             help_open: false,
             detail: None,
+            detail_fetching: false,
+            detail_generation: 0,
+            detail_id: None,
+            news: None,
+            news_fetching: false,
+            news_generation: 0,
+            news_enabled,
+            pane_focus: MainPane::Table,
             theme_index: 0,
             schedule: RefreshScheduler::new(tokio::time::Instant::now(), interval),
         }
@@ -329,6 +428,7 @@ impl App {
             Event::Input(key) if self.detail.is_some() => {
                 if is_esc(key) {
                     self.detail = None;
+                    self.cancel_detail_fetch();
                     Command::Render
                 } else if is_help_toggle(key) {
                     self.help_open = true;
@@ -375,14 +475,18 @@ impl App {
                 self.cycle_theme(is_theme_forward(key));
                 Command::Render
             }
+            Event::Input(key) if is_pane_forward(key) || is_pane_backward(key) => {
+                self.cycle_pane(is_pane_forward(key));
+                Command::Render
+            }
             Event::Input(key) if is_detail_open(key) && self.row_count() > 0 => {
                 if let Some(coin) = self
                     .visible_coins()
                     .get(self.selected)
                     .map(|coin| (*coin).clone())
                 {
-                    self.detail = Some(coin);
-                    Command::Render
+                    self.detail = Some(DetailState::Loading { base: coin.clone() });
+                    self.begin_detail_fetch(coin.id())
                 } else {
                     Command::None
                 }
@@ -405,14 +509,14 @@ impl App {
                 match result {
                     Ok(outcome) => {
                         self.schedule.mark_success(scheduler_now);
-                        if let Some(current) = &self.detail {
+                        if let Some(state) = &mut self.detail {
                             if let Some(updated) = outcome
                                 .snapshot
                                 .coins()
                                 .iter()
-                                .find(|coin| coin.id() == current.id())
+                                .find(|coin| coin.id() == state.base().id())
                             {
-                                self.detail = Some(updated.clone());
+                                state.update_base(updated.clone());
                             }
                         }
                         if outcome.snapshot.coins().is_empty() {
@@ -463,6 +567,56 @@ impl App {
                 self.clamp_selection();
                 Command::Render
             }
+            Event::DetailResult {
+                id,
+                generation,
+                result,
+            } => {
+                if !self.detail_fetching || generation != self.detail_generation {
+                    return Command::None;
+                }
+                self.detail_fetching = false;
+                self.detail_id = None;
+                match result {
+                    Ok(detail) => {
+                        let upgrade = matches!(
+                            &self.detail,
+                            Some(DetailState::Loading { base }) if base.id() == id
+                        );
+                        if upgrade {
+                            if let Some(DetailState::Loading { base }) = self.detail.take() {
+                                self.detail = Some(DetailState::Ready { base, detail });
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(DetailState::Loading { base }) = self.detail.take() {
+                            self.detail = Some(DetailState::Basic(base));
+                        }
+                    }
+                }
+                Command::Render
+            }
+            Event::NewsResult { generation, result } => {
+                if !self.news_fetching || generation != self.news_generation {
+                    return Command::None;
+                }
+                self.news_fetching = false;
+                self.news = Some(match result {
+                    Ok(items) => NewsFeed {
+                        items,
+                        notice: None,
+                    },
+                    Err(error) => {
+                        let items = self.news.take().map(|feed| feed.items).unwrap_or_default();
+                        NewsFeed {
+                            items,
+                            notice: Some(error),
+                        }
+                    }
+                });
+                Command::Render
+            }
             Event::Input(_) => Command::None,
         }
     }
@@ -506,9 +660,57 @@ impl App {
         if matches!(self.state, DataState::Initial) {
             self.state = DataState::Loading;
         }
+        let news_generation = self.begin_news_fetch();
         Command::Fetch {
             generation: self.generation,
+            news_generation,
         }
+    }
+
+    /// Start a detail fetch for the coin id, unless one is already in flight.
+    fn begin_detail_fetch(&mut self, id: &str) -> Command {
+        if self.detail_fetching {
+            return Command::None;
+        }
+        self.detail_fetching = true;
+        self.detail_id = Some(id.to_owned());
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+        Command::FetchDetail {
+            id: id.to_owned(),
+            generation: self.detail_generation,
+        }
+    }
+
+    /// Invalidate any in-flight detail fetch (used when the detail closes).
+    fn cancel_detail_fetch(&mut self) {
+        self.detail_fetching = false;
+        self.detail_id = None;
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+    }
+
+    /// Chain a news fetch onto a market refresh, one in flight at a time.
+    fn begin_news_fetch(&mut self) -> Option<u64> {
+        if !self.news_enabled || self.news_fetching {
+            return None;
+        }
+        self.news_fetching = true;
+        self.news_generation = self.news_generation.wrapping_add(1);
+        Some(self.news_generation)
+    }
+
+    /// Cycle which pane is focused when the terminal is too narrow for
+    /// side-by-side panes; forward `Tab`, backward `Shift-Tab`.
+    fn cycle_pane(&mut self, forward: bool) {
+        const PANES: [MainPane; 3] = [MainPane::Table, MainPane::News, MainPane::Sentiment];
+        let current = PANES
+            .iter()
+            .position(|pane| *pane == self.pane_focus)
+            .unwrap_or(0);
+        self.pane_focus = if forward {
+            PANES[(current + 1) % PANES.len()]
+        } else {
+            PANES[(current + PANES.len() - 1) % PANES.len()]
+        };
     }
 
     pub fn state_ref(&self) -> &DataState {
@@ -589,13 +791,35 @@ impl App {
     pub fn help_open(&self) -> bool {
         self.help_open
     }
-    /// The coin shown on the detail screen, if one is open. `Enter` opens it
-    /// for the selected row and `Esc` closes it without touching selection.
+    /// The row-backed coin shown on the detail screen, if one is open.
+    /// `Enter` opens it for the selected row and `Esc` closes it without
+    /// touching selection. While it is read-only UI: `r`, `?`, `q`, and `Esc`
+    /// stay active, and a completed refresh re-syncs the stored coin by ID.
+    #[cfg(test)]
     pub fn detail(&self) -> Option<&CoinMarket> {
+        self.detail.as_ref().map(DetailState::base)
+    }
+    /// One of `Basic` (row fallback), `Loading`, or `Ready` (rich detail).
+    pub fn detail_state(&self) -> Option<&DetailState> {
         self.detail.as_ref()
+    }
+    /// True while a `/coins/{id}` detail request is in flight. The UI uses it
+    /// to label the sidebar while it upgrades from the row fallback.
+    pub fn detail_fetching(&self) -> bool {
+        self.detail_fetching
     }
     pub fn detail_open(&self) -> bool {
         self.detail.is_some()
+    }
+    /// The newest headline feed, or `None` before the first news result.
+    pub fn news_feed(&self) -> Option<&NewsFeed> {
+        self.news.as_ref()
+    }
+    pub fn news_enabled(&self) -> bool {
+        self.news_enabled
+    }
+    pub fn pane_focus(&self) -> MainPane {
+        self.pane_focus
     }
     /// The active color theme, starting on `THEMES[0]` and cycled at runtime.
     pub fn theme(&self) -> &'static Theme {
@@ -693,10 +917,11 @@ fn clamped_index(index: usize, count: usize) -> usize {
 
 pub struct Controller<P: MarketData + ?Sized> {
     provider: Arc<P>,
+    news: Arc<dyn NewsProvider>,
     events: mpsc::Sender<Event>,
     results: mpsc::Receiver<Event>,
     cancellation: CancellationToken,
-    active: Option<JoinHandle<()>>,
+    tasks: Vec<JoinHandle<()>>,
     refresh_started_at: Option<Instant>,
     tracer: Option<FileLog>,
     pub app: App,
@@ -717,17 +942,39 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         )
     }
 
+    #[cfg(test)]
     pub fn with_interval(provider: Arc<P>, tracer: Option<FileLog>, interval: Duration) -> Self {
+        Self::with_news_and_flag(provider, Arc::new(NoNewsProvider), tracer, interval, false)
+    }
+
+    /// Controller with a real news feed; the app enables news fetches.
+    pub fn with_news(
+        provider: Arc<P>,
+        news: Arc<dyn NewsProvider>,
+        tracer: Option<FileLog>,
+        interval: Duration,
+    ) -> Self {
+        Self::with_news_and_flag(provider, news, tracer, interval, true)
+    }
+
+    fn with_news_and_flag(
+        provider: Arc<P>,
+        news: Arc<dyn NewsProvider>,
+        tracer: Option<FileLog>,
+        interval: Duration,
+        news_enabled: bool,
+    ) -> Self {
         let (events, results) = mpsc::channel(16);
         Self {
             provider,
+            news,
             events,
             results,
             cancellation: CancellationToken::new(),
-            active: None,
+            tasks: Vec::new(),
             refresh_started_at: None,
             tracer,
-            app: App::with_refresh_interval(interval),
+            app: App::with_news_flag(interval, news_enabled),
         }
     }
 
@@ -736,9 +983,8 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
     }
 
     fn dispatch(&mut self, event: Event) {
-        if let Command::Fetch { generation } = self.app.update(event) {
-            self.start_fetch(generation);
-        }
+        let command = self.app.update(event);
+        self.route(command);
     }
 
     fn trace(&self, message: String) {
@@ -747,15 +993,56 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         }
     }
 
-    fn start_fetch(&mut self, generation: u64) {
+    fn route(&mut self, command: Command) {
+        match command {
+            Command::Fetch {
+                generation,
+                news_generation,
+            } => self.start_fetch(generation, news_generation),
+            Command::FetchDetail { id, generation } => self.start_detail_fetch(id, generation),
+            _ => {}
+        }
+    }
+
+    fn spawn(&mut self, task: JoinHandle<()>) {
+        self.tasks.push(task);
+    }
+
+    fn start_fetch(&mut self, generation: u64, news_generation: Option<u64>) {
         self.refresh_started_at = Some(Instant::now());
         self.trace(format!("refresh start generation={generation}"));
         let provider = Arc::clone(&self.provider);
         let sender = self.events.clone();
         let cancelled = self.cancellation.clone();
-        self.active = Some(tokio::spawn(async move {
+        self.spawn(tokio::spawn(async move {
             tokio::select! {
                 result = provider.fetch_snapshot() => { let _ = sender.send(Event::FetchResult { generation, result }).await; }
+                _ = cancelled.cancelled() => {}
+            }
+        }));
+        if let Some(news_generation) = news_generation {
+            let news = Arc::clone(&self.news);
+            let sender = self.events.clone();
+            let cancelled = self.cancellation.clone();
+            self.spawn(tokio::spawn(async move {
+                tokio::select! {
+                    result = news.fetch_headlines() => { let _ = sender.send(Event::NewsResult { generation: news_generation, result }).await; }
+                    _ = cancelled.cancelled() => {}
+                }
+            }));
+        }
+    }
+
+    fn start_detail_fetch(&mut self, id: String, generation: u64) {
+        self.trace(format!(
+            "detail fetch start id={id} generation={generation}"
+        ));
+        let provider = Arc::clone(&self.provider);
+        let sender = self.events.clone();
+        let cancelled = self.cancellation.clone();
+        self.spawn(tokio::spawn(async move {
+            tokio::select! {
+                result = provider.fetch_coin_detail(&id) => { let _ = sender.send(Event::DetailResult { id, generation, result: result.map(Box::new) }).await; }
                 _ = cancelled.cancelled() => {}
             }
         }));
@@ -790,15 +1077,22 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
                 self.trace(line);
             }
         }
-        if let Command::Fetch { generation } = command {
-            self.start_fetch(generation);
+        match &command {
+            Command::Fetch {
+                generation,
+                news_generation,
+            } => self.start_fetch(*generation, *news_generation),
+            Command::FetchDetail { id, generation } => {
+                self.start_detail_fetch(id.clone(), *generation)
+            }
+            _ => {}
         }
         command
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.cancellation.cancel();
-        if let Some(task) = self.active.take() {
+        for task in self.tasks.drain(..) {
             task.await.map_err(|error| {
                 io::Error::other(format!("background task failed during shutdown: {error}"))
             })?;
@@ -808,14 +1102,14 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
 
     #[cfg(test)]
     fn has_active_task(&self) -> bool {
-        self.active.is_some()
+        !self.tasks.is_empty()
     }
 }
 
 impl<P: MarketData + ?Sized> Drop for Controller<P> {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some(task) = self.active.take() {
+        for task in self.tasks.drain(..) {
             task.abort();
         }
     }
@@ -826,11 +1120,14 @@ pub async fn run(config: Config) -> io::Result<()> {
     debug_assert_eq!(config.currency, "usd");
     let provider = CoinGeckoClient::new(&config.base_url, api_key.clone())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let news = RssNewsClient::new(&config.news_url)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let tracer = open_log(&config, api_key)?;
     let mut session = tui::enter()?;
     let result = run_loop(
         session.terminal_mut(),
         Arc::new(provider),
+        Arc::new(news),
         tracer,
         config.refresh_seconds,
     )
@@ -855,12 +1152,14 @@ fn open_log(config: &Config, api_key: Option<String>) -> io::Result<Option<FileL
 async fn run_loop<P: MarketData + 'static>(
     terminal: &mut tui::AppTerminal,
     provider: Arc<P>,
+    news: Arc<dyn NewsProvider>,
     tracer: Option<FileLog>,
     refresh_seconds: u64,
 ) -> io::Result<()> {
     let mut draw = |app: &App| terminal.draw(|frame| ui::render(frame, app)).map(|_| ());
     run_loop_with_sources_and_tracer(
         provider,
+        news,
         EventStream::new(),
         &mut draw,
         tracer,
@@ -880,6 +1179,7 @@ where
 {
     run_loop_with_sources_and_tracer(
         provider,
+        Arc::new(NoNewsProvider),
         input,
         render,
         None,
@@ -890,6 +1190,7 @@ where
 
 async fn run_loop_with_sources_and_tracer<P, S, R>(
     provider: Arc<P>,
+    news: Arc<dyn NewsProvider>,
     mut input: S,
     mut render: R,
     tracer: Option<FileLog>,
@@ -900,7 +1201,7 @@ where
     S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
     R: FnMut(&App) -> io::Result<()>,
 {
-    let mut controller = Controller::with_interval(provider, tracer, refresh_interval);
+    let mut controller = Controller::with_news(provider, news, tracer, refresh_interval);
     let session_log = controller.tracer.clone();
     let render_tracer = session_log.clone();
     let loop_result = async {
@@ -954,6 +1255,9 @@ where
                 Command::Fetch { .. } => {
                     draw(&controller.app)?;
                 }
+                Command::FetchDetail { .. } => {
+                    draw(&controller.app)?;
+                }
                 Command::None => {}
             }
         }
@@ -1002,6 +1306,17 @@ fn is_esc(key: KeyEvent) -> bool {
 /// matched first, so this guard never sees a typing key event.
 fn is_detail_open(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Enter && key.modifiers.is_empty()
+}
+
+/// `Tab` moves focus to the next pane (news, then sentiment, then back);
+/// `Shift-Tab` moves the other way. Pane focus only changes what is visible
+/// at compact widths.
+fn is_pane_forward(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Tab && key.modifiers.is_empty()
+}
+
+fn is_pane_backward(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::BackTab
 }
 
 /// `s` advances the sort cycle; `Shift-S` moves backward. Terminals report the
@@ -1247,7 +1562,7 @@ mod tests {
     #[test]
     fn pure_update_suppresses_duplicate_refresh_and_stale_results() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         assert!(matches!(app.update(Event::Input(key('r'))), Command::None));
@@ -1270,7 +1585,7 @@ mod tests {
             Command::Render
         ));
         assert!(matches!(app.state(), DataState::Ready { .. }));
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         assert!(matches!(
@@ -1289,7 +1604,7 @@ mod tests {
     #[test]
     fn successful_empty_and_startup_failure_have_distinct_states() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         let empty = MarketSnapshot::new(
@@ -1309,7 +1624,7 @@ mod tests {
         assert!(matches!(app.state(), DataState::Empty { .. }));
 
         let mut failed = App::new();
-        let Command::Fetch { generation } = failed.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = failed.update(Event::Start) else {
             panic!()
         };
         failed.update(Event::FetchResult {
@@ -1326,7 +1641,7 @@ mod tests {
     #[test]
     fn selection_clamps_to_rows_and_survives_empty_snapshots() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1369,7 +1684,7 @@ mod tests {
             None,
         );
         let mut many_app = App::new();
-        let Command::Fetch { generation } = many_app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = many_app.update(Event::Start) else {
             panic!()
         };
         many_app.update(Event::FetchResult {
@@ -1378,7 +1693,7 @@ mod tests {
         });
         many_app.select(4);
         assert_eq!(many_app.selected(), 4);
-        let Command::Fetch { generation } = many_app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = many_app.update(Event::Input(key('r'))) else {
             panic!()
         };
         many_app.update(Event::FetchResult {
@@ -1390,7 +1705,7 @@ mod tests {
 
     fn ready_app(count: usize) -> App {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         let rows = (0..count)
@@ -1633,7 +1948,7 @@ mod tests {
     #[test]
     fn state_table_preserves_snapshot_and_freshness_on_refresh_failure() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1648,7 +1963,7 @@ mod tests {
         else {
             panic!()
         };
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1669,7 +1984,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn summary_notice_keeps_rows_and_clears_on_next_clean_success() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1692,7 +2007,7 @@ mod tests {
             } if snapshot.coins().len() == 1 && delay == Duration::from_secs(7)
         ));
 
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1718,7 +2033,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(3)).await;
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!("a manual refresh is allowed once the cooldown passes")
         };
         app.update(Event::FetchResult {
@@ -1745,7 +2060,7 @@ mod tests {
             None,
         );
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1755,7 +2070,7 @@ mod tests {
         let DataState::Empty { refreshed_at, .. } = app.state() else {
             panic!()
         };
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1772,7 +2087,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn success_resets_the_refresh_cadence() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1787,7 +2102,7 @@ mod tests {
             "no automatic refresh before the interval elapses"
         );
         tokio::time::advance(Duration::from_secs(2)).await;
-        let Command::Fetch { generation } = app.update(Event::Tick) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Tick) else {
             panic!("automatic refresh fires once the interval elapses")
         };
         app.update(Event::FetchResult {
@@ -1810,7 +2125,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn retry_after_opens_a_cooldown_that_blocks_manual_refresh() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1845,7 +2160,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn backoff_window_is_capped_after_repeated_failures() {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -1861,7 +2176,7 @@ mod tests {
         for failure in 0..10 {
             let remaining = app.refresh_cooldown().expect("still cooling down");
             tokio::time::advance(remaining + Duration::from_millis(1)).await;
-            let Command::Fetch { generation } = app.update(Event::Tick) else {
+            let Command::Fetch { generation, .. } = app.update(Event::Tick) else {
                 panic!("automatic retry fires after the cooldown window")
             };
             app.update(Event::FetchResult {
@@ -2028,6 +2343,7 @@ mod tests {
             Arc::new(CountingProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
+            Arc::new(NoNewsProvider),
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -2126,6 +2442,7 @@ mod tests {
             Arc::new(CountingProvider {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
+            Arc::new(NoNewsProvider),
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -2159,6 +2476,7 @@ mod tests {
         let tracer = Some(FileLog::append_at(&path, vec![key.into()]).unwrap());
         let result = run_loop_with_sources_and_tracer(
             Arc::new(FailingProvider),
+            Arc::new(NoNewsProvider),
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -2182,7 +2500,7 @@ mod tests {
     #[test]
     fn malformed_response_keeps_last_good_rows_and_renders_cleanly() {
         let mut app = loaded_app(snapshot());
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -2362,7 +2680,7 @@ mod tests {
 
     fn loaded_app(snapshot: MarketSnapshot) -> App {
         let mut app = App::new();
-        let Command::Fetch { generation } = app.update(Event::Start) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Start) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -2379,11 +2697,17 @@ mod tests {
         }
     }
 
+    /// `Enter` commits a search (Render) or opens the detail pane and starts
+    /// the rich-detail fetch (FetchDetail); both are the "did something" forms.
     fn enter(app: &mut App) {
-        assert!(is_render(app.update(Event::Input(KeyEvent::new(
+        let command = app.update(Event::Input(KeyEvent::new(
             KeyCode::Enter,
-            KeyModifiers::NONE
-        )))));
+            KeyModifiers::NONE,
+        )));
+        assert!(
+            matches!(command, Command::Render | Command::FetchDetail { .. }),
+            "Enter must render or open detail"
+        );
     }
 
     #[test]
@@ -2446,7 +2770,7 @@ mod tests {
         let ids: Vec<&str> = app.visible_coins().iter().map(|coin| coin.id()).collect();
         assert_eq!(ids, vec!["bitcoin"], "entered search filters to one match");
 
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -2868,8 +3192,18 @@ mod tests {
             coin_row("litecoin", 2, "Litecoin", "LTC"),
         ]));
         app.select(1);
-        enter(&mut app);
+        assert!(
+            matches!(
+                app.update(Event::Input(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE
+                ))),
+                Command::FetchDetail { .. }
+            ),
+            "Enter starts the rich-detail fetch"
+        );
         assert!(app.detail_open());
+        assert!(app.detail_fetching(), "a detail request is in flight");
         assert_eq!(app.detail().unwrap().id(), "litecoin");
         assert_eq!(
             app.selected(),
@@ -2924,7 +3258,7 @@ mod tests {
 
         enter(&mut app);
         assert!(app.detail_open());
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!("r still refreshes while detail is open")
         };
         app.update(Event::FetchResult {
@@ -2972,7 +3306,7 @@ mod tests {
         let mut app = loaded_app(mixed_snapshot(vec![row(100.0)]));
         enter(&mut app);
         assert_eq!(app.detail().unwrap().price(), Some(100.0));
-        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+        let Command::Fetch { generation, .. } = app.update(Event::Input(key('r'))) else {
             panic!()
         };
         app.update(Event::FetchResult {
@@ -2984,6 +3318,90 @@ mod tests {
             Some(200.0),
             "the detail pane refreshes its coin when the snapshot is replaced"
         );
+    }
+
+    #[test]
+    fn detail_upgrades_from_loading_to_ready_when_the_fetch_returns() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row(
+            "bitcoin", 1, "Bitcoin", "BTC",
+        )]));
+        let Command::FetchDetail { id, generation } = app.update(Event::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("Enter must open the detail and start the rich fetch")
+        };
+        assert_eq!(id, "bitcoin");
+        assert!(matches!(
+            app.detail_state(),
+            Some(DetailState::Loading { .. })
+        ));
+
+        app.update(Event::DetailResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Ok(Box::new(rich_detail())),
+        });
+        assert!(
+            matches!(
+                app.detail_state(),
+                Some(DetailState::Ready { detail, .. }) if detail.ath() == Some(100_000.0)
+            ),
+            "a completed detail fetch upgrades the pane to Ready"
+        );
+        let rendered = render_text(&app);
+        assert!(
+            rendered.contains("ATH: $100K") && rendered.contains("About: A peer-to-peer network"),
+            "the rich detail fields render: {rendered:?}"
+        );
+
+        let stale = app.update(Event::DetailResult {
+            id: "bitcoin".to_owned(),
+            generation: generation.wrapping_add(1),
+            result: Err(ApiError::Transport),
+        });
+        assert!(
+            matches!(stale, Command::None),
+            "a stale-generation detail result is ignored"
+        );
+        assert!(
+            matches!(app.detail_state(), Some(DetailState::Ready { .. })),
+            "a stale result never downgrades a Ready pane"
+        );
+    }
+
+    fn rich_detail() -> CoinDetail {
+        CoinDetail::new(crate::domain::CoinDetailInput {
+            id: "bitcoin".into(),
+            symbol: "btc".into(),
+            name: "Bitcoin".into(),
+            rank: Some(1),
+            price: Some(50_000.0),
+            change_1h: Some(0.1),
+            change_24h: Some(2.0),
+            change_7d: Some(-1.5),
+            change_14d: Some(3.0),
+            change_30d: Some(-2.0),
+            change_60d: Some(5.0),
+            change_1y: Some(40.0),
+            market_cap: Some(1_000_000.0),
+            volume_24h: Some(25_000.0),
+            high_24h: Some(52_000.0),
+            low_24h: Some(49_000.0),
+            ath: Some(100_000.0),
+            atl: Some(3_000.0),
+            ath_change: Some(-50.0),
+            atl_change: Some(1500.0),
+            circulating_supply: Some(19.0),
+            total_supply: Some(21.0),
+            max_supply: Some(21.0),
+            fully_diluted_valuation: Some(1_000_000.0),
+            categories: vec!["layer-1".into(), "store-of-value".into()],
+            sentiment_up: Some(70.0),
+            sentiment_down: Some(30.0),
+            sparkline_7d: vec![1.0, 2.0, 3.0],
+            description: Some("A peer-to-peer network peak store of value.".into()),
+        })
     }
 
     #[test]
@@ -3025,6 +3443,223 @@ mod tests {
         assert!(
             app.detail_open(),
             "cycling a theme keeps the detail pane open"
+        );
+    }
+
+    #[test]
+    fn news_result_stores_items_and_failure_keeps_stale_items_with_notice() {
+        let mut app = App::with_news_enabled(Duration::from_secs(60));
+        // A stale generation (no fetch in flight) is ignored.
+        assert!(matches!(
+            app.update(Event::NewsResult {
+                generation: 7,
+                result: Ok(vec![NewsItem::fixture(
+                    "headline",
+                    "Wire",
+                    "https://x.test/1"
+                )]),
+            }),
+            Command::None
+        ));
+        assert!(app.news_feed().is_none());
+
+        // Start a news fetch via a refresh, then deliver a success.
+        let Command::Fetch {
+            generation,
+            news_generation,
+        } = app.update(Event::Start)
+        else {
+            panic!("Start must request a refresh")
+        };
+        let news_generation = news_generation.expect("news is chained when enabled");
+        assert!(is_render(app.update(Event::NewsResult {
+            generation: news_generation,
+            result: Ok(vec![NewsItem::fixture(
+                "Bitcoin rises",
+                "Wire",
+                "https://x.test/1"
+            )]),
+        })));
+        let feed = app.news_feed().unwrap();
+        assert_eq!(feed.items.len(), 1);
+        assert_eq!(feed.items[0].title(), "Bitcoin rises");
+        assert!(feed.notice.is_none());
+
+        // Complete the market refresh so a manual refresh is allowed, then
+        // drive the news fetch into a failure.
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]))),
+        });
+        let Command::Fetch {
+            news_generation, ..
+        } = app.update(Event::Input(key('r')))
+        else {
+            panic!("manual refresh is allowed once the market fetch completes")
+        };
+        let news_generation = news_generation.expect("news is chained when enabled");
+        assert!(is_render(app.update(Event::NewsResult {
+            generation: news_generation,
+            result: Err(ApiError::HttpStatus { status: 503 }),
+        })));
+        let feed = app.news_feed().unwrap();
+        assert_eq!(feed.items.len(), 1, "stale headlines survive a failure");
+        assert_eq!(feed.notice, Some(ApiError::HttpStatus { status: 503 }));
+    }
+
+    #[test]
+    fn pane_keys_cycle_table_news_sentiment_and_are_swallowed_by_modals() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        assert_eq!(app.pane_focus(), MainPane::Table);
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(is_render(app.update(Event::Input(tab))));
+        assert_eq!(app.pane_focus(), MainPane::News);
+        assert!(is_render(app.update(Event::Input(tab))));
+        assert_eq!(app.pane_focus(), MainPane::Sentiment);
+        assert!(is_render(app.update(Event::Input(tab))));
+        assert_eq!(app.pane_focus(), MainPane::Table, "Tab wraps forward");
+        let shift_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(is_render(app.update(Event::Input(shift_tab))));
+        assert_eq!(
+            app.pane_focus(),
+            MainPane::Sentiment,
+            "Shift-Tab wraps back"
+        );
+
+        // Tab is swallowed while searching, help is open, or detail is open.
+        let mut searching = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        type_query(&mut searching, "a");
+        assert!(matches!(searching.update(Event::Input(tab)), Command::None));
+        assert_eq!(searching.pane_focus(), MainPane::Table);
+
+        let mut help = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        help.update(Event::Input(key('?')));
+        assert!(help.help_open());
+        assert!(matches!(help.update(Event::Input(tab)), Command::None));
+
+        let mut detail = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        enter(&mut detail);
+        assert!(detail.detail_open());
+        assert!(matches!(detail.update(Event::Input(tab)), Command::None));
+    }
+
+    #[test]
+    fn closing_detail_invalidates_an_in_flight_fetch() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row(
+            "bitcoin", 1, "Bitcoin", "BTC",
+        )]));
+        let Command::FetchDetail { id, generation } = app.update(Event::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("Enter must open the detail and start the rich fetch")
+        };
+        assert_eq!(id, "bitcoin");
+        assert!(app.detail_fetching());
+
+        // Esc closes the pane and invalidates the fetch generation.
+        assert!(is_render(app.update(Event::Input(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )))));
+        assert!(!app.detail_open());
+        assert!(!app.detail_fetching());
+
+        // The stale result for the closed pane is ignored.
+        assert!(matches!(
+            app.update(Event::DetailResult {
+                id: "bitcoin".to_owned(),
+                generation,
+                result: Ok(Box::new(rich_detail())),
+            }),
+            Command::None
+        ));
+        assert!(!app.detail_open());
+    }
+
+    #[test]
+    fn news_fetch_chains_to_refresh_once_and_stays_disabled_by_default() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        // News is disabled by default: no news generation is chained.
+        let Command::Fetch {
+            news_generation, ..
+        } = app.update(Event::Start)
+        else {
+            panic!("Start must request a refresh")
+        };
+        assert!(news_generation.is_none(), "news stays disabled by default");
+        assert!(matches!(app.update(Event::Input(key('r'))), Command::None));
+
+        // With news enabled, a refresh chains one news fetch, and a second
+        // refresh while it is in flight does not start a second news fetch.
+        let mut enabled = App::with_news_enabled(Duration::from_secs(60));
+        let Command::Fetch {
+            generation,
+            news_generation,
+        } = enabled.update(Event::Start)
+        else {
+            panic!("Start must request a refresh")
+        };
+        let first_news = news_generation.expect("news is chained when enabled");
+        assert!(
+            matches!(enabled.update(Event::Input(key('r'))), Command::None),
+            "a refresh is already in flight"
+        );
+
+        // Completing the market refresh while the news fetch is still in
+        // flight: a manual refresh chains no second news fetch (one in flight).
+        enabled.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]))),
+        });
+        let Command::Fetch {
+            news_generation, ..
+        } = enabled.update(Event::Input(key('r')))
+        else {
+            panic!("manual refresh is allowed once the fetch completes")
+        };
+        assert!(
+            news_generation.is_none(),
+            "the chained news fetch is still in flight, so no second news fetch starts"
+        );
+
+        // Once the first news result lands, the next refresh chains a fresh
+        // generation.
+        assert!(is_render(enabled.update(Event::NewsResult {
+            generation: first_news,
+            result: Ok(vec![NewsItem::fixture(
+                "headline",
+                "Wire",
+                "https://x.test/1"
+            )]),
+        })));
+        enabled.update(Event::FetchResult {
+            generation: generation.wrapping_add(1),
+            result: Ok(outcome(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]))),
+        });
+        let Command::Fetch {
+            news_generation, ..
+        } = enabled.update(Event::Input(key('r')))
+        else {
+            panic!("manual refresh is allowed once the fetch completes")
+        };
+        assert!(
+            news_generation.is_some_and(|next| next != first_news),
+            "each completed news fetch chains a distinct generation"
+        );
+
+        // A stale news result (generation mismatch) is ignored.
+        assert!(matches!(
+            enabled.update(Event::NewsResult {
+                generation: first_news,
+                result: Ok(vec![NewsItem::fixture("old", "Wire", "https://x.test/1")]),
+            }),
+            Command::None
+        ));
+        assert_eq!(
+            enabled.news_feed().unwrap().items[0].title(),
+            "headline",
+            "a stale news result never replaces the current feed"
         );
     }
 }
