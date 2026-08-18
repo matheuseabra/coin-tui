@@ -69,6 +69,7 @@ Automate terminal setup logic where practical. Manually verify normal exit, `Ctr
 At each UI quality gate, run the keyboard-only path from `PRODUCT.md` with fixture-backed or live data. Also verify:
 
 - resize across compact, standard, and full modes;
+- open the coin detail screen at each width and confirm the left-aligned, width-limited gradient chart with real price labels, the price with its 24-hour change, and the market-stats grid stay inside the pane;
 - cycle every built-in theme (`t`/`Shift-T`) at each supported width and on the detail screen, with the active theme named in the status line when not default;
 - readable output with truecolor and `NO_COLOR=1`;
 - missing values, a flat sparkline, and long remote names;

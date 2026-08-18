@@ -2990,15 +2990,17 @@ mod tests {
     fn theme_cycles_forward_and_backward_and_wraps() {
         let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
         assert_eq!(app.theme().name, "Default");
-        assert!(is_render(app.update(Event::Input(key('t')))));
-        assert_eq!(app.theme().name, "Nord");
-        assert!(is_render(app.update(Event::Input(key('t')))));
-        assert_eq!(app.theme().name, "Monochrome");
+        for expected in ["Nord", "Tokyo Night", "Monochrome"] {
+            assert!(is_render(app.update(Event::Input(key('t')))));
+            assert_eq!(app.theme().name, expected);
+        }
         assert!(is_render(app.update(Event::Input(key('t')))));
         assert_eq!(app.theme().name, "Default", "t wraps forward");
         let shift_t = KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT);
         assert!(is_render(app.update(Event::Input(shift_t))));
         assert_eq!(app.theme().name, "Monochrome", "Shift-T steps backward");
+        assert!(is_render(app.update(Event::Input(shift_t))));
+        assert_eq!(app.theme().name, "Tokyo Night");
         assert!(is_render(app.update(Event::Input(shift_t))));
         assert_eq!(app.theme().name, "Nord");
         assert!(is_render(app.update(Event::Input(shift_t))));

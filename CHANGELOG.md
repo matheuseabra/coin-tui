@@ -14,8 +14,8 @@ become the `0.1.0` changelog on the first tagged release.
 - Compact global market summary: market cap, 24-hour volume, BTC dominance, and 24-hour change.
 - Up to 100 market-cap-ranked coins with price, 1h/24h/7d change, market cap, 24-hour volume, circulating supply, and a 7-day sparkline.
 - Keyboard-only navigation: row/viewport movement, case-insensitive search, stable sort cycling, manual refresh, and a help overlay.
-- A read-only coin detail screen with identity, price and size stats, a 1h/24h/7d change strip, and a bounded 7-day price chart.
-- Three built-in color themes (`Default`, `Nord`, `Monochrome`) cycled live with `t`/`Shift-T`; every theme stays readable without color.
+- A read-only coin detail screen in the CoinMarketCap shape: left-aligned, width-limited content column with identity header, price with 24-hour change, 1h/24h/7d strip, a 7-day gradient area chart with real price labels, and a market-stats grid.
+- Four built-in color themes (`Default`, `Nord`, `Tokyo Night`, `Monochrome`) cycled live with `t`/`Shift-T`; the summary line, table header and selection, change cells, sparkline, detail pane, block titles, and the detail chart's gradient fill are all themed, table rows carry breathing padding, and every theme stays readable without color.
 - Responsive compact, standard, and full layouts with live/refreshing/stale/empty/rate-limited/offline/fatal states.
 - CoinGecko Demo API over HTTPS with an optional `x-cg-demo-api-key` header.
 - Automatic refresh cadence with `Retry-After` and capped jittered backoff, and redacted file tracing.

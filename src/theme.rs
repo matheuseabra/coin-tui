@@ -42,6 +42,16 @@ pub const NORD_THEME: Theme = Theme {
     neutral: Color::Rgb(129, 161, 193),
 };
 
+/// Tokyo Night-inspired accent: the theme's blue, cyan, green, red, and yellow.
+pub const TOKYO_NIGHT_THEME: Theme = Theme {
+    name: "Tokyo Night",
+    summary: Color::Rgb(122, 162, 247),
+    notice: Color::Rgb(224, 175, 104),
+    gain: Color::Rgb(158, 206, 106),
+    loss: Color::Rgb(247, 118, 142),
+    neutral: Color::Rgb(125, 207, 255),
+};
+
 /// Every role maps to the terminal default; readable with `NO_COLOR=1`.
 pub const MONO_THEME: Theme = Theme {
     name: "Monochrome",
@@ -53,4 +63,4 @@ pub const MONO_THEME: Theme = Theme {
 };
 
 /// Built-in themes in cycle order. The first entry is the startup default.
-pub const THEMES: &[Theme] = &[DEFAULT_THEME, NORD_THEME, MONO_THEME];
+pub const THEMES: &[Theme] = &[DEFAULT_THEME, NORD_THEME, TOKYO_NIGHT_THEME, MONO_THEME];

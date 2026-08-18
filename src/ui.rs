@@ -1,13 +1,9 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     prelude::Stylize,
-    style::{Modifier, Style},
-    symbols::Marker,
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Axis, Block, Borders, Cell, Chart, Dataset, HighlightSpacing, Paragraph, Row, Table,
-        TableState,
-    },
+    widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -62,13 +58,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         .split(area);
 
     frame.render_widget(
-        Paragraph::new(summary_line(app, frame.area().width))
-            .style(Style::default().fg(theme.summary))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Market summary "),
-            ),
+        Paragraph::new(summary_line(app, frame.area().width, theme)).block(
+            Block::default().borders(Borders::ALL).title(Line::styled(
+                " Market summary ",
+                Style::default().fg(theme.summary),
+            )),
+        ),
         areas[0],
     );
     render_body(frame, app, areas[1], frame.area().width);
@@ -120,12 +115,25 @@ fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect, theme: &Theme
 
 fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, width: u16) {
     if let Some(coin) = app.detail() {
-        render_detail(frame, coin, area, width, app.theme());
+        render_detail(frame, coin, area, app.theme());
         return;
     }
+    let theme = app.theme();
     match app.state_ref() {
-        DataState::Initial => message("Market | Initial", "Starting market data...", frame, area),
-        DataState::Loading => message("Market | Loading", "Loading market data...", frame, area),
+        DataState::Initial => message(
+            "Market | Initial",
+            "Starting market data...",
+            frame,
+            area,
+            theme,
+        ),
+        DataState::Loading => message(
+            "Market | Loading",
+            "Loading market data...",
+            frame,
+            area,
+            theme,
+        ),
         DataState::Ready { notice, .. } => {
             let info = notice
                 .iter()
@@ -163,7 +171,7 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
                     "Press r to refresh."
                 }));
             }
-            message_lines("Market | Empty", body, frame, area);
+            message_lines("Market | Empty", body, frame, area, theme);
         }
         DataState::Fatal(error) => {
             let mut body = vec![Line::from(fatal_message(error))];
@@ -175,13 +183,19 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
                     remaining.as_secs().max(1)
                 )));
             }
-            message_lines("Market | Error", body, frame, area);
+            message_lines("Market | Error", body, frame, area, theme);
         }
     }
 }
 
-fn message(title: &str, text: &str, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-    message_lines(title, vec![Line::from(text.to_owned())], frame, area);
+fn message(
+    title: &str,
+    text: &str,
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    theme: &Theme,
+) {
+    message_lines(title, vec![Line::from(text.to_owned())], frame, area, theme);
 }
 
 fn message_lines(
@@ -189,9 +203,13 @@ fn message_lines(
     lines: Vec<Line<'static>>,
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
+    theme: &Theme,
 ) {
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(Line::styled(
+            format!(" {title} "),
+            Style::default().fg(theme.notice),
+        ))),
         area,
     );
 }
@@ -204,7 +222,11 @@ fn table_frame(
     area: ratatui::layout::Rect,
     width: u16,
 ) {
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let theme = app.theme();
+    let block = Block::default().borders(Borders::ALL).title(Line::styled(
+        format!(" {title} "),
+        Style::default().fg(theme.summary),
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let table_area = if info.is_empty() {
@@ -224,59 +246,146 @@ fn table_frame(
     render_table(frame, app, table_area, width);
 }
 
-/// Read-only coin detail pane: identity line, price/size stats, colored change
-/// strip, and the 7-day price chart. It renders only from the snapshot row's
-/// already-normalized series, so it needs no extra provider call and works
-/// offline against the fixture server.
+/// Read-only coin detail pane in a scaled-down CoinMarketCap shape: a left-
+/// aligned content column capped at `DETAIL_CONTENT_WIDTH` holds the identity
+/// header (rank chip, name, symbol), the price with its 24-hour change, the
+/// 1h/24h/7d change strip, a fixed-geometry gradient area chart with real
+/// price labels, and the market-stats grid. It renders only from the snapshot
+/// row's already-normalized series, so it needs no extra provider call and
+/// works offline against the fixture server.
 fn render_detail(
     frame: &mut Frame<'_>,
     coin: &CoinMarket,
     area: ratatui::layout::Rect,
-    _width: u16,
     theme: &Theme,
 ) {
     let title = clean_remote(coin.name(), 48);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", title));
+    let block = Block::default().borders(Borders::ALL).title(Line::styled(
+        format!(" {} ", title),
+        Style::default().fg(theme.notice),
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let [head, stats, changes, chart] = Layout::default()
+    let content_width = DETAIL_CONTENT_WIDTH.min(inner.width);
+    let [content, _] = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(content_width), Constraint::Min(0)])
+        .areas(inner);
+    let [head, price, changes, chart, stats] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
+            Constraint::Length(1),
         ])
-        .areas(inner);
+        .areas(content);
 
     let rank = coin
         .rank()
-        .map_or_else(|| "-".into(), |rank| format!("#{rank}"));
-    let identity = clean_remote(
-        &format!("{rank}  {} ({})", coin.name(), coin.symbol()),
-        inner.width as usize,
-    );
+        .map_or_else(|| "-".into(), |value| format!("#{value}"));
+    let identity = Line::from(vec![
+        Span::styled(
+            rank,
+            Style::default()
+                .fg(theme.summary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} ({})", coin.name(), coin.symbol()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]);
     frame.render_widget(
-        Paragraph::new(identity).style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(truncate_line(identity, content_width as usize)),
         head,
     );
 
-    let price = format_price(coin.price());
+    frame.render_widget(
+        Paragraph::new(truncate_line(
+            price_line(coin, theme),
+            content_width as usize,
+        )),
+        price,
+    );
+    frame.render_widget(
+        Paragraph::new(truncate_line(
+            change_line(coin, theme),
+            content_width as usize,
+        )),
+        changes,
+    );
+    render_price_chart(frame, coin, chart, theme);
+
     let cap = format_compact_money(coin.market_cap());
     let volume = format_compact_money(coin.volume_24h());
     let supply = format_compact_supply(coin.circulating_supply());
     let stats_line = clean_remote(
-        &format!("Price: {price} | Mkt cap: {cap} | Vol 24h: {volume} | Supply: {supply}"),
-        inner.width as usize,
+        &format!("Mkt cap: {cap} | Vol 24h: {volume} | Supply: {supply}"),
+        content_width as usize,
     );
-    frame.render_widget(Paragraph::new(stats_line), stats);
-    frame.render_widget(Paragraph::new(change_line(coin, theme)), changes);
-    render_chart(frame, coin, chart, theme);
+    frame.render_widget(
+        Paragraph::new(stats_line).style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(theme.notice),
+        ),
+        stats,
+    );
+}
+
+/// Truncate a styled line to `max_cells` display cells, keeping the surviving
+/// spans' styles and cutting the span that crosses the boundary.
+fn truncate_line(line: Line<'static>, max_cells: usize) -> Line<'static> {
+    let mut used = 0usize;
+    let mut out = Line::default();
+    for span in line {
+        let width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + width <= max_cells {
+            out.push_span(span);
+            used += width;
+        } else if used < max_cells {
+            let mut room = max_cells - used;
+            let mut cut = String::new();
+            for character in span.content.chars() {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if character_width > room {
+                    break;
+                }
+                cut.push(character);
+                room -= character_width;
+            }
+            out.push_span(Span::styled(cut, span.style));
+            used = max_cells;
+        }
+        if used >= max_cells {
+            break;
+        }
+    }
+    out
+}
+
+/// The price with its 24-hour change, mirroring the CoinMarketCap detail header:
+/// the price is the dominant bold value and the change is colored by sign.
+fn price_line(coin: &CoinMarket, theme: &Theme) -> Line<'static> {
+    let mut line = Line::from(Span::styled(
+        format_price(coin.price()),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let change_style = match finite(coin.change_24h()) {
+        Some(value) if value > 0.0 => Style::default().fg(theme.gain),
+        Some(value) if value < 0.0 => Style::default().fg(theme.loss),
+        _ => Style::default(),
+    };
+    line.push_span(Span::styled(
+        format!("   {} (24h)", format_percentage(coin.change_24h())),
+        change_style,
+    ));
+    line
 }
 
 /// The 1h/24h/7d change strip with per-segment themed color. Each value is
@@ -303,49 +412,231 @@ fn change_line(coin: &CoinMarket, theme: &Theme) -> Line<'static> {
 /// series can never unbounded the chart's memory or layout work.
 const MAX_CHART_POINTS: usize = 512;
 
-fn render_chart(
+/// Detail content column width: the CMC-style page stays one fixed width no
+/// matter the terminal, hugging the pane's left border instead of stretching
+/// across the screen.
+const DETAIL_CONTENT_WIDTH: u16 = 56;
+
+/// Number of body rows the price chart draws (plus one caption line below).
+const CHART_ROWS: u16 = 6;
+
+const MIN_CHART_AREA_WIDTH: u16 = 34;
+const MIN_CHART_AREA_HEIGHT: u16 = 4;
+
+/// Number of gradient shades used to fade the area fill away from the line.
+const GRADIENT_SHADES: usize = 8;
+
+/// The chart line color and where its gradient starts: gain, loss, or neutral
+/// by the sign of the 7-day change.
+fn trend_color(coin: &CoinMarket, theme: &Theme) -> Color {
+    match finite(coin.change_7d()) {
+        Some(value) if value >= 0.0 => theme.gain,
+        Some(_) => theme.loss,
+        None => theme.neutral,
+    }
+}
+
+/// A bounded, left-aligned 7-day gradient area chart styled after the
+/// CoinMarketCap price chart. The already-filtered series is min-max
+/// normalized into `[0.0, 1.0]` (flat or overflow falls back to a mid-line),
+/// sampled at half-block resolution, and filled from the line down to the
+/// bottom with a gradient that fades away from the line. Real price labels
+/// and the range caption use the `accent` color. Returns `None` when the pane
+/// is too small or there is no finite series to plot.
+fn price_chart_lines(
+    series: &[f64],
+    area_width: u16,
+    area_height: u16,
+    trend: Color,
+    accent: Color,
+) -> Option<Vec<Line<'static>>> {
+    if area_width < MIN_CHART_AREA_WIDTH || area_height < MIN_CHART_AREA_HEIGHT {
+        return None;
+    }
+    let (points, low, high) = bounded_chart_points(series);
+    if points.is_empty() {
+        return None;
+    }
+    let values = if points.len() == 1 {
+        vec![points[0], points[0]]
+    } else {
+        points
+    };
+    let rows = CHART_ROWS.min(area_height.saturating_sub(2)).max(2) as usize;
+
+    let mut labels = Vec::with_capacity(rows);
+    let mut label_width = 0usize;
+    for row in 0..rows {
+        let t = if rows == 1 {
+            0.0
+        } else {
+            row as f64 / (rows - 1) as f64
+        };
+        let price = if high > low {
+            high - (high - low) * t
+        } else {
+            high
+        };
+        let text = format_price(Some(price));
+        label_width = label_width.max(UnicodeWidthStr::width(text.as_str()));
+        labels.push(text);
+    }
+    let graph_width = (area_width as usize).saturating_sub(label_width + 2).max(4);
+
+    let ramp = gradient_ramp(trend, GRADIENT_SHADES);
+    let half_rows = rows * 2;
+    let mut lines = Vec::with_capacity(rows + 1);
+    for (row, label) in labels.iter().enumerate() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let pad = label_width - UnicodeWidthStr::width(label.as_str());
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
+        }
+        spans.push(Span::styled(label.clone(), Style::default().fg(accent)));
+        spans.push(Span::raw(" "));
+        let mut run: Option<(char, Color)> = None;
+        let mut run_len = 0usize;
+        for column in 0..graph_width {
+            let t = if graph_width == 1 {
+                0.0
+            } else {
+                column as f64 / (graph_width - 1) as f64
+            };
+            let value = sample_series(&values, t).clamp(0.0, 1.0);
+            let line_sub = ((1.0 - value) * (half_rows - 1) as f64).round() as usize;
+            let top = row * 2;
+            let bottom = top + 1;
+            let (glyph, distance) = match (top >= line_sub, bottom >= line_sub) {
+                (true, true) => ('█', Some(top - line_sub)),
+                (true, false) => ('▀', Some(top - line_sub)),
+                (false, true) => ('▄', Some(bottom - line_sub)),
+                (false, false) => (' ', None),
+            };
+            let fill = match distance {
+                Some(distance) => ramp[(distance / 2).min(ramp.len() - 1)],
+                None => Color::Reset,
+            };
+            push_run(&mut spans, &mut run, &mut run_len, glyph, fill);
+        }
+        flush_run(&mut spans, &mut run, &mut run_len);
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "7 days: {} → {}",
+            format_price(Some(low)),
+            format_price(Some(high))
+        ),
+        Style::default().fg(accent),
+    )));
+    Some(lines)
+}
+
+/// Sample the normalized series at fraction `t` across `[0.0, 1.0]` of its
+/// length, linearly interpolating between points.
+fn sample_series(points: &[f64], t: f64) -> f64 {
+    let last = (points.len() - 1) as f64;
+    let position = (t * last).min(last);
+    let left = position.floor() as usize;
+    let right = (left + 1).min(points.len() - 1);
+    let fraction = position - left as f64;
+    points[left] + (points[right] - points[left]) * fraction
+}
+
+/// Append `glyph` to the current styled run, merging consecutive cells that
+/// share a glyph and color so each chart row stays a small number of spans.
+fn push_run(
+    spans: &mut Vec<Span<'static>>,
+    run: &mut Option<(char, Color)>,
+    run_len: &mut usize,
+    glyph: char,
+    color: Color,
+) {
+    if *run == Some((glyph, color)) {
+        *run_len += 1;
+        return;
+    }
+    flush_run(spans, run, run_len);
+    *run = Some((glyph, color));
+    *run_len = 1;
+}
+
+fn flush_run(spans: &mut Vec<Span<'static>>, run: &mut Option<(char, Color)>, run_len: &mut usize) {
+    if let Some((glyph, color)) = run.take() {
+        spans.push(Span::styled(
+            glyph.to_string().repeat(*run_len),
+            Style::default().fg(color),
+        ));
+    }
+}
+
+fn render_price_chart(
     frame: &mut Frame<'_>,
     coin: &CoinMarket,
     area: ratatui::layout::Rect,
     theme: &Theme,
 ) {
-    let (points, low, high) = bounded_chart_points(coin.sparkline_7d());
-    if points.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No 7-day price data available.").centered(),
-            area,
-        );
+    let Some(lines) = price_chart_lines(
+        coin.sparkline_7d(),
+        area.width,
+        area.height,
+        trend_color(coin, theme),
+        theme.summary,
+    ) else {
+        frame.render_widget(Paragraph::new("No 7-day price data available."), area);
         return;
-    }
-    let x_max = (points.len().saturating_sub(1)).max(1) as f64;
-    let fg = match finite(coin.change_7d()) {
-        Some(value) if value >= 0.0 => theme.gain,
-        Some(_) => theme.loss,
-        None => theme.neutral,
     };
-    let style = Style::default().fg(fg);
-    let data: Vec<(f64, f64)> = points
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, value)| (index as f64, value))
-        .collect();
-    let dataset = Dataset::default()
-        .marker(Marker::Dot)
-        .style(style)
-        .data(&data);
-    let chart = Chart::new(vec![dataset])
-        .x_axis(Axis::default().title("7 days").bounds([0.0, x_max]))
-        .y_axis(
-            Axis::default()
-                .title(format!(
-                    "{} → {}",
-                    format_price(Some(low)),
-                    format_price(Some(high))
-                ))
-                .bounds([0.0, 1.0]),
-        );
-    frame.render_widget(chart, area);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// A ramp of `steps` shades from `base` down to a darkened endpoint, so the
+/// area fill fades away from the chart line like a CoinMarketCap gradient.
+/// Named ANSI colors are mapped to the RGB value typical terminals render so
+/// every color theme gets a gradient, while `Color::Reset` (Monochrome) and
+/// unknown roles return a solid ramp and stay readable without color.
+fn gradient_ramp(base: Color, steps: usize) -> Vec<Color> {
+    let steps = steps.max(1);
+    let Some((r, g, b)) = color_to_rgb(base) else {
+        return vec![base; steps];
+    };
+    let darken = |channel: u8| (channel as u16 * 35 / 100).min(255) as u8;
+    let (er, eg, eb) = (darken(r), darken(g), darken(b));
+    (0..steps)
+        .map(|i| {
+            let t = i as f32 / (steps - 1) as f32;
+            Color::Rgb(
+                (r as f32 + (er as f32 - r as f32) * t).round() as u8,
+                (g as f32 + (eg as f32 - g as f32) * t).round() as u8,
+                (b as f32 + (eb as f32 - b as f32) * t).round() as u8,
+            )
+        })
+        .collect()
+}
+
+/// Convert a color to RGB for gradient interpolation. Named ANSI colors use
+/// the bright xterm-style value typical terminals render; `Reset` and unknown
+/// indexed colors return `None` so the ramp stays solid.
+fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    Some(match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (230, 60, 60),
+        Color::LightRed => (255, 110, 110),
+        Color::Green => (70, 200, 100),
+        Color::LightGreen => (120, 230, 150),
+        Color::Blue => (70, 130, 235),
+        Color::LightBlue => (120, 170, 255),
+        Color::Yellow => (235, 190, 60),
+        Color::LightYellow => (255, 230, 120),
+        Color::Magenta => (200, 90, 190),
+        Color::LightMagenta => (240, 140, 230),
+        Color::Cyan => (60, 190, 210),
+        Color::LightCyan => (120, 220, 235),
+        Color::White => (220, 220, 220),
+        Color::Gray => (130, 130, 130),
+        Color::DarkGray => (85, 85, 85),
+        Color::Reset | Color::Indexed(_) => return None,
+    })
 }
 
 /// Downsample to `MAX_CHART_POINTS` equal buckets, then min-max normalize into
@@ -658,7 +949,7 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
         .header(header)
         .column_spacing(1)
         .highlight_spacing(HighlightSpacing::Never)
-        .row_highlight_style(Style::default().reversed());
+        .row_highlight_style(Style::default().fg(theme.summary).reversed());
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -712,6 +1003,7 @@ fn make_row(coin: &CoinMarket, columns: &[Column], theme: &Theme) -> Row<'static
             .map(|column| make_cell(coin, column, theme))
             .collect::<Vec<_>>(),
     )
+    .height(2)
 }
 
 fn make_cell(coin: &CoinMarket, column: &Column, theme: &Theme) -> Cell<'static> {
@@ -832,7 +1124,7 @@ fn cell_style(coin: &CoinMarket, column: &Column, theme: &Theme) -> Style {
     let change = match column.kind {
         CellKind::Change1h => coin.change_1h(),
         CellKind::Change24h => coin.change_24h(),
-        CellKind::Change7d => coin.change_7d(),
+        CellKind::Change7d | CellKind::Trend => coin.change_7d(),
         _ => return Style::default(),
     };
     match finite(change) {
@@ -846,16 +1138,44 @@ fn finite(value: Option<f64>) -> Option<f64> {
     value.filter(|value| value.is_finite())
 }
 
-fn summary_line(app: &App, width: u16) -> String {
+/// The market summary line: each label uses the summary accent, the values
+/// stay plain, and the market-cap change is colored by sign. Compact widths
+/// (< 80) drop separators so the line still fits; the text matches the
+/// placeholder variants exactly.
+fn summary_line(app: &App, width: u16, theme: &Theme) -> Line<'static> {
+    let label_style = Style::default().fg(theme.summary);
+    let change_style = |value: Option<f64>| match finite(value) {
+        Some(value) if value > 0.0 => Style::default().fg(theme.gain),
+        Some(value) if value < 0.0 => Style::default().fg(theme.loss),
+        _ => Style::default(),
+    };
     let values = match app.state_ref() {
         DataState::Ready { snapshot, .. }
         | DataState::Empty { snapshot, .. }
         | DataState::Stale { snapshot, .. } => snapshot.summary(),
         DataState::Initial | DataState::Loading | DataState::Fatal(_) => {
             return if width < 80 {
-                "Cap:- Vol24:- BTCdom:- Mkt24:-".into()
+                Line::from(vec![
+                    Span::styled("Cap:", label_style),
+                    Span::raw("-"),
+                    Span::styled(" Vol24:", label_style),
+                    Span::raw("-"),
+                    Span::styled(" BTCdom:", label_style),
+                    Span::raw("-"),
+                    Span::styled(" Mkt24:", label_style),
+                    Span::styled("-", change_style(None)),
+                ])
             } else {
-                "Cap: - | Vol 24h: - | BTC dom: - | Mkt 24h: -".into()
+                Line::from(vec![
+                    Span::styled("Cap: ", label_style),
+                    Span::raw("-"),
+                    Span::styled(" | Vol 24h: ", label_style),
+                    Span::raw("-"),
+                    Span::styled(" | BTC dom: ", label_style),
+                    Span::raw("-"),
+                    Span::styled(" | Mkt 24h: ", label_style),
+                    Span::styled("-", change_style(None)),
+                ])
             };
         }
     };
@@ -864,9 +1184,27 @@ fn summary_line(app: &App, width: u16) -> String {
     let dominance = summary_percentage(values.btc_dominance(), false);
     let change = summary_percentage(values.market_cap_change_24h(), true);
     if width < 80 {
-        format!("Cap:{cap} Vol24:{volume} BTCdom:{dominance} Mkt24:{change}")
+        Line::from(vec![
+            Span::styled("Cap:", label_style),
+            Span::raw(cap),
+            Span::styled(" Vol24:", label_style),
+            Span::raw(volume),
+            Span::styled(" BTCdom:", label_style),
+            Span::raw(dominance),
+            Span::styled(" Mkt24:", label_style),
+            Span::styled(change, change_style(values.market_cap_change_24h())),
+        ])
     } else {
-        format!("Cap: {cap} | Vol 24h: {volume} | BTC dom: {dominance} | Mkt 24h: {change}")
+        Line::from(vec![
+            Span::styled("Cap: ", label_style),
+            Span::raw(cap),
+            Span::styled(" | Vol 24h: ", label_style),
+            Span::raw(volume),
+            Span::styled(" | BTC dom: ", label_style),
+            Span::raw(dominance),
+            Span::styled(" | Mkt 24h: ", label_style),
+            Span::styled(change, change_style(values.market_cap_change_24h())),
+        ])
     }
 }
 
@@ -1112,6 +1450,20 @@ mod tests {
     use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
     use std::time::Duration;
 
+    const TEST_THEME: Theme = crate::theme::DEFAULT_THEME;
+
+    fn line_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn is_chart_row(line: &Line) -> bool {
+        let text = line_text(line);
+        text.contains('$') && text.contains(['█', '▀', '▄'])
+    }
+
     fn app_with(result: Result<crate::api::FetchOutcome, ApiError>) -> App {
         let mut app = App::new();
         let Command::Fetch { generation } = app.update(Event::Start) else {
@@ -1257,13 +1609,18 @@ mod tests {
         assert!(rendered.contains("Vol 24h: $987M"));
         assert!(rendered.contains("BTC dom: 52.50%"));
         assert!(rendered.contains("Mkt 24h: -1.25%"));
-        assert_eq!(summary_line(&complete, 80).matches("|").count(), 3);
+        assert_eq!(
+            line_text(&summary_line(&complete, 80, &TEST_THEME))
+                .matches("|")
+                .count(),
+            3
+        );
 
         let missing = app_with(Ok(crate::api::FetchOutcome {
             snapshot: snapshot("Bitcoin"),
             summary_notice: None,
         }));
-        let compact = summary_line(&missing, 60);
+        let compact = line_text(&summary_line(&missing, 60, &TEST_THEME));
         assert_eq!(compact, "Cap:- Vol24:- BTCdom:- Mkt24:-");
         assert!(compact.contains("Cap") && compact.contains("Vol24") && compact.contains("BTCdom"));
     }
@@ -1274,7 +1631,7 @@ mod tests {
             snapshot: summary_snapshot(),
             summary_notice: None,
         }));
-        let compact = summary_line(&app, 60);
+        let compact = line_text(&summary_line(&app, 60, &TEST_THEME));
         assert!(UnicodeWidthStr::width(compact.as_str()) <= 58);
         let rendered = text_at(&app, 60, 16);
         assert_eq!(rendered.matches("Cap:$").count(), 1);
@@ -1294,7 +1651,7 @@ mod tests {
             ),
             summary_notice: None,
         }));
-        let extreme_line = summary_line(&extreme, 60);
+        let extreme_line = line_text(&summary_line(&extreme, 60, &TEST_THEME));
         assert!(UnicodeWidthStr::width(extreme_line.as_str()) <= 58);
         for value in [
             "Cap:$999T+",
@@ -1539,6 +1896,192 @@ mod tests {
             rendered.contains("+2.50%")
                 && rendered.contains("-1.50%")
                 && rendered.contains("+0.05%")
+        );
+    }
+
+    #[test]
+    fn trend_sparkline_cell_is_colored_by_7d_change_sign() {
+        let theme = crate::theme::DEFAULT_THEME;
+        let trend = &FULL_COLUMNS[10];
+        let market = |change_7d: Option<f64>| {
+            MarketSnapshot::new(
+                MarketSummaryInput {
+                    total_market_cap: None,
+                    total_volume_24h: None,
+                    btc_dominance: None,
+                    market_cap_change_24h: None,
+                },
+                vec![CoinMarketInput {
+                    id: "trend".into(),
+                    rank: None,
+                    name: "Trend".into(),
+                    symbol: "TR".into(),
+                    price: None,
+                    change_1h: None,
+                    change_24h: None,
+                    change_7d,
+                    market_cap: None,
+                    volume_24h: None,
+                    circulating_supply: None,
+                    sparkline_7d: vec![1.0, 3.0, 2.0, 4.0],
+                }],
+                None,
+            )
+        };
+        let up = market(Some(5.0));
+        assert_eq!(
+            cell_style(&up.coins()[0], trend, &theme).fg,
+            Some(Color::Green),
+            "rising sparkline is colored with the gain role"
+        );
+        assert!(
+            cell_text(&up.coins()[0], trend)
+                .chars()
+                .any(|ch| SPARKLINE_GLYPHS.contains(&ch)),
+            "glyphs remain as text"
+        );
+        let down = market(Some(-5.0));
+        assert_eq!(
+            cell_style(&down.coins()[0], trend, &theme).fg,
+            Some(Color::Red),
+            "falling sparkline is colored with the loss role"
+        );
+        let none = market(None);
+        assert_eq!(
+            cell_style(&none.coins()[0], trend, &theme).fg,
+            None,
+            "a sparkline without a 7d change stays uncolored"
+        );
+    }
+
+    #[test]
+    fn trend_follows_the_7d_change_sign() {
+        let theme = crate::theme::DEFAULT_THEME;
+        let market = |change_7d: Option<f64>| {
+            MarketSnapshot::new(
+                MarketSummaryInput {
+                    total_market_cap: None,
+                    total_volume_24h: None,
+                    btc_dominance: None,
+                    market_cap_change_24h: None,
+                },
+                vec![CoinMarketInput {
+                    id: "chart".into(),
+                    rank: None,
+                    name: "Chart".into(),
+                    symbol: "CH".into(),
+                    price: None,
+                    change_1h: None,
+                    change_24h: None,
+                    change_7d,
+                    market_cap: None,
+                    volume_24h: None,
+                    circulating_supply: None,
+                    sparkline_7d: vec![1.0, 2.0, 3.0],
+                }],
+                None,
+            )
+        };
+        let up = market(Some(2.0));
+        assert_eq!(
+            trend_color(&up.coins()[0], &theme),
+            Color::Green,
+            "rising chart uses the gain role"
+        );
+        let down = market(Some(-2.0));
+        assert_eq!(
+            trend_color(&down.coins()[0], &theme),
+            Color::Red,
+            "falling chart uses the loss role"
+        );
+        let none = market(None);
+        assert_eq!(
+            trend_color(&none.coins()[0], &theme),
+            Color::Cyan,
+            "a chart without a 7d change uses the neutral role"
+        );
+    }
+
+    #[test]
+    fn price_chart_is_left_aligned_bounded_and_gradient_styled() {
+        let trend = Color::Rgb(200, 100, 50);
+        let accent = Color::Cyan;
+        let chart =
+            price_chart_lines(&[1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0], 56, 10, trend, accent).unwrap();
+        assert_eq!(
+            chart.len(),
+            CHART_ROWS as usize + 1,
+            "CHART_ROWS body rows plus the caption line"
+        );
+        let body = &chart[..chart.len() - 1];
+        assert!(
+            body.iter()
+                .all(|line| UnicodeWidthStr::width(line_text(line).as_str()) <= 56),
+            "every row stays inside the content column"
+        );
+        assert!(
+            body.iter().all(|line| is_chart_row(line)),
+            "every chart row has a price label and a fixed-width glyph run"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(trend))),
+            "the line and its near fill use the full trend color"
+        );
+        assert!(
+            body.iter()
+                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(accent))),
+            "the price labels use the accent color"
+        );
+        assert!(
+            line_text(chart.last().unwrap()).contains("7 days:"),
+            "caption shows the range: {:?}",
+            chart.last().unwrap()
+        );
+
+        let flat = price_chart_lines(&[5.0, 5.0, 5.0], 56, 10, trend, accent).unwrap();
+        assert!(
+            flat.iter()
+                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(trend))),
+            "flat series renders a mid-line with the trend color"
+        );
+        assert_eq!(
+            price_chart_lines(&[f64::NAN, f64::INFINITY], 56, 10, trend, accent),
+            None,
+            "all-non-finite series has nothing to plot"
+        );
+        assert_eq!(
+            price_chart_lines(&[1.0, 2.0], 20, 10, trend, accent),
+            None,
+            "pane below the minimum width is skipped"
+        );
+    }
+
+    #[test]
+    fn gradient_ramp_fades_rgb_and_stays_solid_without_one() {
+        let ramp = gradient_ramp(Color::Rgb(200, 100, 50), 5);
+        assert_eq!(ramp.len(), 5);
+        assert_eq!(ramp[0], Color::Rgb(200, 100, 50));
+        assert!(
+            ramp.windows(2).all(|stage| match (stage[0], stage[1]) {
+                (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
+                    [r0 >= r1, g0 >= g1, b0 >= b1]
+                        .into_iter()
+                        .all(|darker| darker)
+                }
+                _ => false,
+            }),
+            "each stage darkens toward the endpoint"
+        );
+        assert_eq!(
+            gradient_ramp(Color::Reset, 4),
+            vec![Color::Reset; 4],
+            "Monochrome stays solid and colorless"
+        );
+        assert_eq!(
+            gradient_ramp(Color::Green, 3).len(),
+            3,
+            "named ANSI colors are converted to RGB so they can fade"
         );
     }
 
@@ -1986,17 +2529,23 @@ mod tests {
     fn loading_summary_uses_width_appropriate_placeholder() {
         let mut loading = App::new();
         loading.update(Event::Start);
-        assert_eq!(summary_line(&loading, 60), "Cap:- Vol24:- BTCdom:- Mkt24:-");
         assert_eq!(
-            summary_line(&loading, 80),
+            line_text(&summary_line(&loading, 60, &TEST_THEME)),
+            "Cap:- Vol24:- BTCdom:- Mkt24:-"
+        );
+        assert_eq!(
+            line_text(&summary_line(&loading, 80, &TEST_THEME)),
             "Cap: - | Vol 24h: - | BTC dom: - | Mkt 24h: -"
         );
         let fatal = app_with(Err(ApiError::Transport));
         assert_eq!(
-            summary_line(&fatal, 80),
+            line_text(&summary_line(&fatal, 80, &TEST_THEME)),
             "Cap: - | Vol 24h: - | BTC dom: - | Mkt 24h: -"
         );
-        assert_eq!(summary_line(&fatal, 60), "Cap:- Vol24:- BTCdom:- Mkt24:-");
+        assert_eq!(
+            line_text(&summary_line(&fatal, 60, &TEST_THEME)),
+            "Cap:- Vol24:- BTCdom:- Mkt24:-"
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -2614,15 +3163,19 @@ mod tests {
         )]);
         let rendered = text_at(&app, 80, 24);
         assert!(rendered.contains("#1  Bitcoin (BTC)"), "{rendered:?}");
-        assert!(rendered.contains("Price: $50.0K"), "{rendered:?}");
+        assert!(
+            rendered.contains("$50.0K"),
+            "price emphasized: {rendered:?}"
+        );
+        assert!(rendered.contains("+1.50% (24h)"), "{rendered:?}");
         assert!(rendered.contains("Mkt cap: $1T"), "{rendered:?}");
         assert!(rendered.contains("Vol 24h: $25.0B"), "{rendered:?}");
         assert!(rendered.contains("Supply: 19.7M"), "{rendered:?}");
         assert!(rendered.contains("1h: +0.50%"), "{rendered:?}");
         assert!(rendered.contains("24h: +1.50%"), "{rendered:?}");
         assert!(rendered.contains("7d: -2.00%"), "{rendered:?}");
-        assert!(rendered.contains("7 days"), "chart x axis: {rendered:?}");
-        assert!(rendered.contains("•"), "chart markers render: {rendered:?}");
+        assert!(rendered.contains("7 days:"), "chart caption: {rendered:?}");
+        assert!(rendered.contains('█'), "chart area renders: {rendered:?}");
     }
 
     #[test]
@@ -2633,7 +3186,7 @@ mod tests {
             rendered.contains("No 7-day price data available."),
             "{rendered:?}"
         );
-        assert!(!rendered.contains("7 days"), "{rendered:?}");
+        assert!(!rendered.contains("7 days:"), "{rendered:?}");
     }
 
     #[test]
@@ -2647,7 +3200,7 @@ mod tests {
         )]);
         let rendered = text_at(&hostile, 80, 24);
         assert!(
-            rendered.contains("•"),
+            rendered.contains('█'),
             "non-finite points are dropped: {rendered:?}"
         );
 
@@ -2660,7 +3213,7 @@ mod tests {
         )]);
         let rendered = text_at(&flat, 80, 24);
         assert!(
-            rendered.contains("•"),
+            rendered.contains('█'),
             "flat series renders a mid-line: {rendered:?}"
         );
 
@@ -2673,7 +3226,7 @@ mod tests {
         )]);
         let rendered = text_at(&huge, 80, 24);
         assert!(
-            rendered.contains("•"),
+            rendered.contains('█'),
             "long series is downsampled and renders: {rendered:?}"
         );
     }
@@ -2689,14 +3242,14 @@ mod tests {
         )]);
         let compact = text_at(&app, 60, 16);
         assert!(compact.contains("#1  Bitcoin (BTC)"), "{compact:?}");
-        assert!(compact.contains("•"), "{compact:?}");
+        assert!(compact.contains('█'), "{compact:?}");
         assert!(
             compact.contains("Esc back | ? help | q quit | r refresh"),
             "{compact:?}"
         );
         let full = text_at(&app, 120, 30);
         assert!(full.contains("#1  Bitcoin (BTC)"), "{full:?}");
-        assert!(full.contains("•"), "{full:?}");
+        assert!(full.contains('█'), "{full:?}");
     }
 
     #[test]
@@ -2763,7 +3316,7 @@ mod tests {
             summary_notice: None,
         }));
         assert_eq!(app.theme().name, "Default");
-        for expected in ["Nord", "Monochrome"] {
+        for expected in ["Nord", "Tokyo Night", "Monochrome"] {
             app.update(Event::Input(KeyEvent::new(
                 KeyCode::Char('t'),
                 KeyModifiers::NONE,
@@ -2789,7 +3342,7 @@ mod tests {
             -2.0,
             vec![1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0],
         )]);
-        for expected in ["Default", "Nord", "Monochrome"] {
+        for expected in ["Default", "Nord", "Tokyo Night", "Monochrome"] {
             assert_eq!(app.theme().name, expected);
             for (width, height) in [(60u16, 16u16), (80u16, 24u16), (120u16, 30u16)] {
                 let rendered = text_at(&app, width, height);
@@ -2812,12 +3365,18 @@ mod tests {
             .iter()
             .map(|theme| theme.name)
             .collect();
-        assert_eq!(names, ["Default", "Nord", "Monochrome"]);
+        assert_eq!(names, ["Default", "Nord", "Tokyo Night", "Monochrome"]);
         assert_ne!(
             crate::theme::THEMES[0].summary,
             crate::theme::THEMES[1].summary
         );
         assert_ne!(crate::theme::THEMES[0].gain, crate::theme::THEMES[1].gain);
+        assert_ne!(
+            crate::theme::THEMES[1].gain,
+            crate::theme::THEMES[2].gain,
+            "Nord and Tokyo Night differ in gain color"
+        );
+        assert_eq!(crate::theme::THEMES[2].name, "Tokyo Night");
         assert_eq!(crate::theme::THEMES[0].name, "Default");
     }
 
@@ -2827,6 +3386,10 @@ mod tests {
             snapshot: summary_snapshot(),
             summary_notice: None,
         }));
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Char('t'),
+            KeyModifiers::NONE,
+        )));
         app.update(Event::Input(KeyEvent::new(
             KeyCode::Char('t'),
             KeyModifiers::NONE,
