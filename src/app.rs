@@ -18,6 +18,7 @@ use crate::{
     config::Config,
     domain::{CoinMarket, MarketSnapshot},
     log::FileLog,
+    theme::{Theme, THEMES},
     tui, ui,
 };
 
@@ -73,6 +74,8 @@ pub struct App {
     search: SearchState,
     sort: SortState,
     help_open: bool,
+    detail: Option<CoinMarket>,
+    theme_index: usize,
     schedule: RefreshScheduler,
 }
 
@@ -296,6 +299,8 @@ impl App {
             search: SearchState::default(),
             sort: SortState::default(),
             help_open: false,
+            detail: None,
+            theme_index: 0,
             schedule: RefreshScheduler::new(tokio::time::Instant::now(), interval),
         }
     }
@@ -316,6 +321,22 @@ impl App {
             Event::Input(key) if self.help_open => {
                 if is_help_toggle(key) || is_esc(key) {
                     self.help_open = false;
+                    Command::Render
+                } else {
+                    Command::None
+                }
+            }
+            Event::Input(key) if self.detail.is_some() => {
+                if is_esc(key) {
+                    self.detail = None;
+                    Command::Render
+                } else if is_help_toggle(key) {
+                    self.help_open = true;
+                    Command::Render
+                } else if is_refresh(key) {
+                    self.request_refresh()
+                } else if is_theme_forward(key) || is_theme_backward(key) {
+                    self.cycle_theme(is_theme_forward(key));
                     Command::Render
                 } else {
                     Command::None
@@ -350,6 +371,22 @@ impl App {
                 Command::Render
             }
             Event::Input(key) if is_refresh(key) => self.request_refresh(),
+            Event::Input(key) if is_theme_forward(key) || is_theme_backward(key) => {
+                self.cycle_theme(is_theme_forward(key));
+                Command::Render
+            }
+            Event::Input(key) if is_detail_open(key) && self.row_count() > 0 => {
+                if let Some(coin) = self
+                    .visible_coins()
+                    .get(self.selected)
+                    .map(|coin| (*coin).clone())
+                {
+                    self.detail = Some(coin);
+                    Command::Render
+                } else {
+                    Command::None
+                }
+            }
             Event::Input(key) if navigation_key(key.code) => {
                 self.navigate(key.code);
                 Command::Render
@@ -368,6 +405,16 @@ impl App {
                 match result {
                     Ok(outcome) => {
                         self.schedule.mark_success(scheduler_now);
+                        if let Some(current) = &self.detail {
+                            if let Some(updated) = outcome
+                                .snapshot
+                                .coins()
+                                .iter()
+                                .find(|coin| coin.id() == current.id())
+                            {
+                                self.detail = Some(updated.clone());
+                            }
+                        }
                         if outcome.snapshot.coins().is_empty() {
                             self.state = DataState::Empty {
                                 snapshot: outcome.snapshot,
@@ -541,6 +588,28 @@ impl App {
     }
     pub fn help_open(&self) -> bool {
         self.help_open
+    }
+    /// The coin shown on the detail screen, if one is open. `Enter` opens it
+    /// for the selected row and `Esc` closes it without touching selection.
+    pub fn detail(&self) -> Option<&CoinMarket> {
+        self.detail.as_ref()
+    }
+    pub fn detail_open(&self) -> bool {
+        self.detail.is_some()
+    }
+    /// The active color theme, starting on `THEMES[0]` and cycled at runtime.
+    pub fn theme(&self) -> &'static Theme {
+        &THEMES[self.theme_index]
+    }
+    /// Advance or retreat one built-in theme; wraps at both ends.
+    pub fn cycle_theme(&mut self, forward: bool) {
+        let len = THEMES.len();
+        let next = if forward {
+            (self.theme_index + 1) % len
+        } else {
+            (self.theme_index + len - 1) % len
+        };
+        self.theme_index = next;
     }
     /// Remaining failure cooldown window, if one is open. UI uses it to
     /// replace the "press r to retry" call-to-action with a countdown.
@@ -928,6 +997,13 @@ fn is_esc(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Esc && key.modifiers.is_empty()
 }
 
+/// `Enter` opens the coin detail screen for the selected row. While search
+/// editing is open `Enter` commits the query instead; the search branch is
+/// matched first, so this guard never sees a typing key event.
+fn is_detail_open(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Enter && key.modifiers.is_empty()
+}
+
 /// `s` advances the sort cycle; `Shift-S` moves backward. Terminals report the
 /// shifted char as `S` (with or without the SHIFT modifier) or as `s` plus the
 /// modifier, so both spellings are accepted.
@@ -981,6 +1057,19 @@ fn clear_active_search(key: KeyEvent) -> bool {
 
 fn is_refresh(key: KeyEvent) -> bool {
     key.kind == KeyEventKind::Press && key.code == KeyCode::Char('r') && key.modifiers.is_empty()
+}
+
+/// `t` advances the theme; `Shift-T` moves backward. Like sorting, terminals
+/// report the shifted char as `T` (with or without the SHIFT modifier) or as
+/// `t` plus the modifier, so both spellings are accepted.
+fn is_theme_forward(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char('t') && key.modifiers.is_empty()
+}
+
+fn is_theme_backward(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && (key.code == KeyCode::Char('T')
+            || (key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::SHIFT)))
 }
 
 fn navigation_key(code: KeyCode) -> bool {
@@ -2770,5 +2859,170 @@ mod tests {
         type_query(&mut app, "btc?eth");
         assert_eq!(app.search_buffer(), "btc?eth");
         assert!(!app.help_open(), "? while typing never opens help");
+    }
+
+    #[test]
+    fn enter_opens_detail_for_the_selected_coin_and_esc_returns_preserving_selection() {
+        let mut app = loaded_app(mixed_snapshot(vec![
+            coin_row("bitcoin", 1, "Bitcoin", "BTC"),
+            coin_row("litecoin", 2, "Litecoin", "LTC"),
+        ]));
+        app.select(1);
+        enter(&mut app);
+        assert!(app.detail_open());
+        assert_eq!(app.detail().unwrap().id(), "litecoin");
+        assert_eq!(
+            app.selected(),
+            1,
+            "selection is untouched while detail is open"
+        );
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(is_render(app.update(Event::Input(esc))));
+        assert!(!app.detail_open());
+        assert_eq!(app.selected(), 1, "Esc returns with selection preserved");
+        assert_eq!(app.visible_coins()[app.selected()].id(), "litecoin");
+    }
+
+    #[test]
+    fn detail_is_modal_but_keeps_esc_help_refresh_and_quit() {
+        let mut app = loaded_app(mixed_snapshot(vec![
+            coin_row("bitcoin", 1, "Bitcoin", "BTC"),
+            coin_row("litecoin", 2, "Litecoin", "LTC"),
+        ]));
+        enter(&mut app);
+        assert!(app.detail_open());
+        let selected = app.selected();
+        for route in ['j', 'k', 'g', 'G', 's', 'S', '/'] {
+            assert!(
+                matches!(app.update(Event::Input(key(route))), Command::None),
+                "{route} is swallowed while detail is open"
+            );
+        }
+        assert_eq!(app.selected(), selected, "navigation is blocked in detail");
+        assert!(!app.sort_active(), "sort is blocked in detail");
+        assert!(!app.searching(), "search is blocked in detail");
+        assert!(!app.fetching(), "no refresh started by swallowed keys");
+
+        assert!(is_render(app.update(Event::Input(key('?')))));
+        assert!(
+            app.help_open() && app.detail_open(),
+            "? opens help over detail"
+        );
+        assert!(is_render(app.update(Event::Input(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )))));
+        assert!(
+            !app.help_open() && app.detail_open(),
+            "Esc closes help before the detail pane"
+        );
+        assert!(is_render(app.update(Event::Input(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        )))));
+        assert!(!app.detail_open(), "a second Esc returns to the table");
+
+        enter(&mut app);
+        assert!(app.detail_open());
+        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+            panic!("r still refreshes while detail is open")
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(snapshot())),
+        });
+        assert!(
+            app.detail_open(),
+            "a completed refresh keeps the detail pane open"
+        );
+        assert!(matches!(app.update(Event::Input(key('q'))), Command::Quit));
+    }
+
+    #[test]
+    fn enter_on_empty_rows_does_not_open_detail() {
+        let mut fresh = App::new();
+        assert!(matches!(
+            fresh.update(Event::Input(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Command::None
+        ));
+        assert!(!fresh.detail_open());
+
+        let mut empty = loaded_app(mixed_snapshot(vec![]));
+        assert!(matches!(
+            empty.update(Event::Input(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            ))),
+            Command::None
+        ));
+        assert!(!empty.detail_open());
+    }
+
+    #[test]
+    fn detail_coin_tracks_a_refreshed_snapshot_by_id() {
+        let row = |price| {
+            with_numbers(
+                coin_row("bitcoin", 1, "Bitcoin", "BTC"),
+                (price, 1.0, 2.0, 3.0, 1000.0, 10.0, 5.0),
+            )
+        };
+        let mut app = loaded_app(mixed_snapshot(vec![row(100.0)]));
+        enter(&mut app);
+        assert_eq!(app.detail().unwrap().price(), Some(100.0));
+        let Command::Fetch { generation } = app.update(Event::Input(key('r'))) else {
+            panic!()
+        };
+        app.update(Event::FetchResult {
+            generation,
+            result: Ok(outcome(mixed_snapshot(vec![row(200.0)]))),
+        });
+        assert_eq!(
+            app.detail().unwrap().price(),
+            Some(200.0),
+            "the detail pane refreshes its coin when the snapshot is replaced"
+        );
+    }
+
+    #[test]
+    fn theme_cycles_forward_and_backward_and_wraps() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        assert_eq!(app.theme().name, "Default");
+        assert!(is_render(app.update(Event::Input(key('t')))));
+        assert_eq!(app.theme().name, "Nord");
+        assert!(is_render(app.update(Event::Input(key('t')))));
+        assert_eq!(app.theme().name, "Monochrome");
+        assert!(is_render(app.update(Event::Input(key('t')))));
+        assert_eq!(app.theme().name, "Default", "t wraps forward");
+        let shift_t = KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT);
+        assert!(is_render(app.update(Event::Input(shift_t))));
+        assert_eq!(app.theme().name, "Monochrome", "Shift-T steps backward");
+        assert!(is_render(app.update(Event::Input(shift_t))));
+        assert_eq!(app.theme().name, "Nord");
+        assert!(is_render(app.update(Event::Input(shift_t))));
+        assert_eq!(app.theme().name, "Default", "Shift-T wraps backward");
+    }
+
+    #[test]
+    fn theme_key_is_typed_text_while_searching() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        type_query(&mut app, "t");
+        assert_eq!(app.search_buffer(), "t");
+        assert_eq!(app.theme().name, "Default", "no theme change while typing");
+    }
+
+    #[test]
+    fn theme_still_cycles_while_detail_is_open() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));
+        enter(&mut app);
+        assert!(app.detail_open());
+        assert!(is_render(app.update(Event::Input(key('t')))));
+        assert_eq!(app.theme().name, "Nord");
+        assert!(
+            app.detail_open(),
+            "cycling a theme keeps the detail pane open"
+        );
     }
 }

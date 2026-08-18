@@ -33,8 +33,8 @@ The first release includes:
 The first release excludes:
 
 - trading, wallets, accounts, portfolios, and financial calculations;
-- news, AI features, alerts, sentiment, prediction markets, and token detail pages;
-- watchlist persistence, alternate currencies, providers, and themes;
+- news, AI features, alerts, sentiment, and prediction markets;
+- watchlist persistence, alternate currencies, and providers;
 - token image downloads and a mouse-first experience;
 - an HTTP server, browser UI, remote daemon, and plugin API;
 - full feature or visual parity with CoinMarketCap.
@@ -75,11 +75,22 @@ The minimum supported terminal is 60 columns by 16 rows. Below that size, the pr
 | `G`, `End` | Select the last visible coin. |
 | `PageUp`, `PageDown` | Move by one viewport. |
 | `/` | Enter search mode. |
-| `Esc` | Cancel search or close help. |
-| `Enter` | Apply search. |
+| `Esc` | Cancel search, close help, or return from the coin detail screen. |
+| `Enter` | Apply search, or open the selected coin's detail screen. |
 | `s`, `Shift-S` | Cycle sort key forward or backward. |
 | `r` | Request a refresh unless one is active or cooling down. |
+| `t`, `Shift-T` | Cycle the color theme forward or backward. |
 | `?` | Toggle keybinding help. |
+
+## Coin Detail
+
+`Enter` on a selected row opens a read-only detail screen for that coin. The screen keeps the market summary for context and replaces the table with the coin's identity, price and size stats, a color-coded 1h/24h/7d change strip, and its 7-day price chart. `Esc` returns to the table with the selection and viewport unchanged.
+
+The detail chart renders the 7-day price series already delivered by the markets snapshot; it makes no extra provider request and behaves the same when stale, offline, or offline-fixture-driven. A flat or hostile series renders as a bounded flat line, an all-missing series shows a placeholder message, and long series are downsampled to a fixed point budget. Color only reinforces the sign of each change; every value remains sign-prefixed text. While the detail screen is open, navigation, search, and sort keys are ignored; `r`, `?`, `q`, and `Esc` stay active.
+
+## Themes
+
+`t` and `Shift-T` cycle between built-in themes without restarting: `Default`, `Nord`, and `Monochrome`. The status line names the active theme whenever it is not the startup default. A theme recolors the summary, table header, change cells, detail change strip, chart line, help overlay, resize message, and no-results notices. Color only reinforces text, never carries meaning alone, and no layout, column, or state decision depends on the active theme, so every theme renders at every supported width and stays readable without color (including with `NO_COLOR=1` and the `Monochrome` theme).
 
 Search is case-insensitive over coin name and symbol. Sorting is stable, missing values sort last, and selection remains on the same coin ID when possible. Each sortable numeric column appears in the cycle in both directions: `s` advances through rank, price, 1h, 24h, 7d, cap, volume, and supply (ascending then descending) and `Shift-S` steps backward. The status line shows the active key and direction; the default rank order shows no indicator.
 
@@ -102,6 +113,6 @@ Market data refreshes automatically every 60 seconds while the connection is hea
 
 ## Product Quality
 
-The release is acceptable when users can complete this keyboard-only path: start the app, identify broad market direction, find Bitcoin, sort by 7-day change, return to rank order, refresh, inspect freshness, and quit with the terminal restored.
+The release is acceptable when users can complete this keyboard-only path: start the app, identify broad market direction, find Bitcoin, open its detail screen and read its 7-day chart, return to the table, sort by 7-day change, return to rank order, refresh, inspect freshness, and quit with the terminal restored.
 
 The dashboard must remain readable without color, at every supported width, and while showing missing values or stale data. Verification criteria are defined in `TESTING.md`; delivery state is tracked in `ROADMAP.md`.

@@ -165,15 +165,18 @@ Quality gate `G4`:
 
 Goal: produce a documented, reproducible first release.
 
-- [ ] `M5-01` Complete the user README with installation, API key setup, controls, screenshots, limitations, and troubleshooting.
+- [x] `M5-01` Complete the user README with installation, API key setup, controls, screenshots, limitations, and troubleshooting.
   Depends on: `G4`.
   Acceptance: a clean-shell walkthrough follows only README instructions and reaches live or fixture-backed data.
-- [ ] `M5-02` Add license, changelog, release profile, and package metadata.
+  Evidence: `README.md` rewritten (features, two fixture-backed screenshot captures, prerequisites, install and quick-start with the free demo key, an offline fixture-server quick start, the full `PRODUCT.md` controls table, responsive layouts, status states, the flag/env configuration table, troubleshooting, limitations, and development commands). The walkthrough was executed from a detached clean shell following only the README's "Run offline with the fixture server" steps: `scripts/fixture-server.py --port 8137` plus `./target/release/coin-tui --base-url http://127.0.0.1:8137/` reached a `LIVE` fixture-backed dashboard with summary and rows, `q` restored the shell, and the resumed shell ran the next command.
+- [x] `M5-02` Add license, changelog, release profile, and package metadata.
   Depends on: `G4`.
   Acceptance: `cargo package --list` contains only intended files and metadata has no placeholders.
-- [ ] `M5-03` Add platform release builds for macOS and Linux.
+  Evidence: MIT license chosen by the user (`LICENSE`), `CHANGELOG.md` (Keep a Changelog format, `[Unreleased]` first-release section), `[profile.release]` with `lto = "thin"`, `codegen-units = 1`, `strip = true`, and complete `[package]` metadata (description, `license = "MIT"`, readme, repository/homepage, keywords, categories, and `exclude` of `.github/`, `.opencode/`, `.gitignore`, `AGENTS.md`). `cargo package --allow-dirty --list` shows only intended files (LICENSE, CHANGELOG, README, `docs/`, `scripts/`, `src/`, `tests/`, Cargo.toml, Cargo.lock, rust-toolchain.toml), metadata has no placeholders, `cargo package` verification packaged 31 files (411.3KiB) and compiled the crate, and fmt, Clippy with denied warnings, 133 locked tests (102 unit + 31 provider), and locked debug and release builds pass.
+- [x] `M5-03` Add platform release builds for macOS and Linux.
   Depends on: `M5-02`.
   Acceptance: CI builds release artifacts and records checksums; publishing remains manual.
+  Evidence: `.github/workflows/release.yml` builds `--release --locked` on `ubuntu-latest` and `macos-latest` (tag `v*` push or manual `workflow_dispatch`), names each binary from the runner's actual target triple, records a `shasum -a 256` checksum beside it, and uploads `coin-tui-<os>` artifacts; it creates no GitHub Release and publishes nothing to crates.io. The workflow YAML parses, `actions/upload-artifact@043fb46` (v7.0.1) is SHA-pinned like the checkout, and the artifact/checksum steps were reproduced locally against the release binary (produced `coin-tui-aarch64-apple-darwin.sha256`). CI will only run on the first tag push or manual dispatch; that remains the verification risk.
 - [ ] `M5-04` Run the release matrix and resolve all release-blocking defects.
   Depends on: `M5-01`, `M5-03`.
   Acceptance: results are recorded for macOS Terminal, iTerm2, and one Linux terminal at compact, standard, and full widths; unsupported environments are documented.
@@ -185,14 +188,44 @@ Quality gate `G5`:
 - [ ] The release matrix passes with no critical or high-severity known defect.
 - [ ] A human approves the release; no agent publishes artifacts without explicit approval.
 
+Work on the M5 release track stops at `M5-03`. `M5-04` and the `G5` release gate
+stay open as the release gate; they are not prerequisites for `M6` feature work.
+
+## M6: Detail, Theme, And Content Tracks
+
+Goal: add read-only coin detail and a historical chart, themeable and refined table
+rendering, and news/sentiment content without weakening the keyboard-only core or
+the `PRODUCT.md` layout guarantees.
+
+- [x] `M6-01` Coin detail and historical chart screen.
+  Depends on: `M5-03`.
+  Acceptance: selecting a row opens a read-only detail view; the 7-day price history chart renders bounded, empty, and non-finite series without a panic; `Esc` returns to the table with selection and state preserved.
+  Evidence: `Enter` stores the selected row in `App.detail` and `Esc` clears it without touching `selected` or the table viewport (`src/app.rs`); while open, navigation/search/sort keys are swallowed but `r`, `?`, `q`, and `Esc` stay active, and a completed refresh re-syncs the stored coin by ID from the new snapshot. The detail pane replaces only the table area, keeps the market summary, and draws identity, price/size stats, a sign-prefixed 1h/24h/7d strip, and the 7-day chart (`render_detail`/`render_chart` in `src/ui.rs`). The chart reuses the snapshot's normalized `sparkline_7d` series, downsampled to `MAX_CHART_POINTS = 512` buckets, min-max scaled into `[0.0, 1.0]` with flat/overflow fallback, so hostile, empty, and non-finite series render without panic and no new provider endpoint or dependency was added. New tests cover open/Esc-with-selection, the modal key set, refresh-by-ID sync, empty-list Enter, and rendering at 60x16/80x24/120x30 with empty, hostile, flat, and 2000-point series; 112 unit + 31 provider tests pass with fmt and Clippy (denied warnings). A fixture-backed walkthrough (`scripts/fixture-server.py` on loopback port 8138) opened coin 1 in 80x24, rendered the chart markers and `7 days` axis, `Esc` restored the table with the LIVE status, and `q` exited with `loop stopped success=true` and the shell restored. Product and architecture contracts updated in `docs/PRODUCT.md` (Enter/Esc rows, new `Coin Detail` section, non-goal removed) and `docs/ARCHITECTURE.md` (`Coin Detail Screen`).
+- [x] `M6-02` Themes, improved table layout and colors.
+  Depends on: `M5-03`.
+  Acceptance: at least two built-in themes switch without restarting; every theme stays readable without color and passes the required layout sizes with no out-of-bounds rendering.
+  Evidence: new `src/theme.rs` defines semantic color roles (`summary`, `notice`, `gain`, `loss`, `neutral`) and `THEMES` in cycle order (`Default`, `Nord`, `Monochrome`); `App` owns only `theme_index`, exposed as `App::theme` and mutated by `App::cycle_theme` guarded by `t`/`Shift-T` (`src/app.rs`), active on the table and on the detail screen and typed as text while searching. Every style site in `src/ui.rs` now reads a theme role, the table header is tinted with the summary role, and the status line names a non-default theme. Layout and state transitions never read the theme; `Monochrome` maps every role to `Color::Reset`, so text, signs, and glyphs carry meaning without color. New tests (app + ui) cover forward/backward cycling and wrap, typing `t`, cycling while detail is open, per-theme rendering of the table and detail screen at 60x16/80x24/120x30, theme distinctness, a full-buffer check that `Monochrome` colors nothing, and the non-default theme status marker; 120 unit + 31 provider tests pass with fmt and Clippy (denied warnings). A fixture-backed walkthrough (loopback port 8139, 80x24) cycled Default→Nord→Monochrome and back with `t`/`Shift-T`, confirmed the status line (`LIVE | age 15s | theme: Nord | …`) and the new help binding live, and `q` exited with `loop stopped success=true`. Product, architecture, testing, and changelog contracts updated (`docs/PRODUCT.md` `t`/`Shift-T` rows and `Themes` section, non-goal removed; `docs/ARCHITECTURE.md` module map plus `Themes`; `docs/TESTING.md` manual scenario; `CHANGELOG.md`).
+- [ ] `M6-03` News and sentiment as tabs or a sidebar.
+  Depends on: `M6-01`.
+  Acceptance: keyboard-only tab or sidebar navigation reaches news and sentiment content; remote text and feeds are bounded and sanitized like the market tables and never block the refresh loop.
+
+Quality gate `G6`:
+
+- [ ] All M6 tasks are accepted.
+- [ ] The baseline checks in `docs/TESTING.md` pass with the new screens and feeds.
+- [ ] Manual checks confirm each new surface at compact, standard, and full widths, readable without color.
+
 ## Deferred Tracks
 
 These items require a new milestone and acceptance criteria. They are not implicit MVP work:
 
 - persistent watchlists and local configuration files;
 - alternate quote currencies and providers;
-- coin detail and historical chart screens;
-- configurable columns and themes;
+- configurable columns;
 - Windows release support;
-- news, sentiment, alerts, trading, accounts, or AI features;
+- alerts, trading, accounts, or AI features;
 - an Axum service, browser UI, remote daemon, or plugin API.
+
+Note: the `M6` milestone now schedules the previously deferred coin detail and
+historical chart screens, themes plus table layout and colors, and news/sentiment
+as tabs or a sidebar.

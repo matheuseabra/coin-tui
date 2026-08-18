@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify pinned Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Assemble artifact and record SHA-256 checksum
+        run: |
+          set -euo pipefail
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          mkdir -p dist
+          cp target/release/coin-tui "dist/coin-tui-$triple"
+          (cd dist && shasum -a 256 "coin-tui-$triple" > "coin-tui-$triple.sha256")
+
+      - name: Show recorded checksum
+        run: cat dist/*.sha256
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46 # v7.0.1
+        with:
+          name: coin-tui-${{ matrix.os }}
+          path: dist/

@@ -52,6 +52,16 @@ struct FetchOutcome {
 
 Refreshing a ready, empty, or stale state keeps the snapshot visible and sets `fetching: true` separately. A transient fetch error after any successful response produces `Stale`; it does not erase the last snapshot, its freshness, or an existing optional-summary notice. A clean later summary replaces or clears that notice. Only failures with no successful snapshot can produce `Fatal`.
 
+### Coin Detail Screen
+
+`Enter` on a selected row stores the selected `CoinMarket` clone in `App.detail`; `Esc` clears it. Opening and closing never touch `selected`, so the table's selection and viewport are preserved across the transition. While `detail` is set the input update is modal: navigation, search, and sort keys fall through to `Command::None`, while `r`, `?`, `q`, and `Esc` remain active. A successful refresh replaces the stored coin with the matching-ID row from the new snapshot, so the pane stays fresh without holding a second query to the provider.
+
+The detail view is a pure render of the existing snapshot row. The 7-day chart (`render_chart` in `ui.rs`) reuses the already-normalized `sparkline_7d` series, downsampled to at most `MAX_CHART_POINTS = 512` equal buckets and min-max normalized into `[0.0, 1.0]` (flat or overflow range renders as a bounded mid-line). This keeps every `Chart` axis bound finite, so hostile, empty, or overflowing series cannot panic the renderer, and it deliberately adds no provider endpoint or dependency.
+
+### Themes
+
+`Theme` (`theme.rs`) defines a small set of semantic color roles (`summary`, `notice`, `gain`, `loss`, `neutral`) plus a display name. `THEMES` lists the built-ins in cycle order (`Default`, `Nord`, `Monochrome`); the first entry is the startup default. `App` owns only a `theme_index: usize`, exposed as `App::theme` and mutated by `App::cycle_theme` (`t` and `Shift-T` guards in `update`, active on the table and on the detail screen and swallowed while typing or when help is open). Every style site in `ui.rs` reads a role from the active theme and nothing else, so switching themes is a pure re-render. Layout, columns, and state transitions never read the theme: `Monochrome` maps every role to `Color::Reset`, and the rendering tests prove each theme draws at every supported width with no out-of-bounds output and no dependence on color for meaning.
+
 ## Module Map
 
 Start with this structure and split further only when a file becomes difficult to navigate:
@@ -64,6 +74,7 @@ src/
 |-- api.rs           # MarketData trait, CoinGecko client and DTO conversion
 |-- domain.rs        # provider-independent market types
 |-- format.rs        # deterministic money, percentage and supply formatting
+|-- theme.rs         # built-in color themes as semantic roles
 `-- ui.rs            # responsive layout and Ratatui rendering
 tests/
 |-- fixtures/        # small, sanitized provider responses
