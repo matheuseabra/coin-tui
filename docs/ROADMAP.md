@@ -208,6 +208,9 @@ the `PRODUCT.md` layout guarantees.
 - [ ] `M6-03` News and sentiment as tabs or a sidebar.
   Depends on: `M6-01`.
   Acceptance: keyboard-only tab or sidebar navigation reaches news and sentiment content; remote text and feeds are bounded and sanitized like the market tables and never block the refresh loop.
+- [ ] `M6-04` CoinMarketCap-style coin detail redesign with `rasciigraph` charts.
+  Depends on: `M6-01`.
+  Acceptance: the detail screen mirrors the simplified CoinMarketCap coin-detail reference the user supplied: an identity block (rank, name, symbol), the price and 24-hour change next to the price chart, and a market-stats grid (for example market cap, 24h volume, circulating supply, and all-time high), all at compact, standard, and full widths with no out-of-bounds rendering and readable without color. The 7-day price chart is drawn with the `rasciigraph` crate (v0.3.0, MIT, no default runtime dependencies), bounded like the sparkline, with empty, non-finite, and hostile-series tests. `Enter`/`Esc` behavior and selection preservation from `M6-01` keep passing. Note: the reference screenshot could not be read by the editor model (image input unsupported), so the exact statistic set and arrangement must be confirmed against `docs/PRODUCT.md` before acceptance; when the dependency is added, record `rasciigraph` and its purpose in `docs/ARCHITECTURE.md` per the dependency rule.
 
 Quality gate `G6`:
 
