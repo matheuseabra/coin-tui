@@ -145,16 +145,21 @@ Goal: behave predictably under real network, terminal, and provider failures.
   Depends on: `G3`.
   Acceptance: help is complete; invalid currency, interval, base URL, and conflicting options fail before terminal entry with actionable messages.
   Evidence: `src/config.rs` centralizes typed `clap` parsing for `--refresh-seconds`, `--currency`, `--base-url`, `--api-key`, and `--log-file` with matching environment variables where documented; config tests cover defaults, complete help output, minimum interval, USD-only currency, HTTPS-or-loopback base URLs, no credential echo in base-URL errors, and a real parser/env conflict. Startup probes against `target/debug/coin-tui` showed complete help plus code-2 plain-stderr failures for `--currency eur`, `--refresh-seconds 5`, `--base-url http://example.com/`, `--base-url https://user:secret-password@example.com/` without printing the password, and `COIN_TUI_BASE_URL=... --base-url ...`, all before alternate-screen entry; sanitized probe evidence is in `.omo/evidence/M4-03-cli-probes.md`. Gates after implementation and repair: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (100 unit + 31 provider), and `cargo build --locked` all pass.
-- [ ] `M4-04` Measure idle and refresh behavior and remove observed hot loops.
+- [x] `M4-04` Measure idle and refresh behavior and remove observed hot loops.
   Depends on: `M4-01`.
   Acceptance: idle rendering is event-driven, idle CPU is recorded for a 60-second release run, and refresh timing is recorded against a local delayed mock.
+  Evidence: The run loop is event-driven: `Controller::start_fetch` stamps `refresh_started_at` and the loop traces `refresh ok/failed ... duration=NNNms` plus a `render ok duration=NNNms` line per draw. A paused-time regression test `idle_rendering_is_event_driven_and_steady` counted 30 and 31 renders across two 30-second idle windows, exactly the 1 Hz tick cadence. `scripts/fixture-server.py` (loopback CoinGecko-compatible mock) and `scripts/measure-idle.sh` (detached 120x30 tmux run, `ps -o %cpu=` sampling) recorded a 60-second idle release run at 0.09% average CPU (2.1% peak) with 64 traced renders over ~61 seconds, so no hot loop existed to remove; a 250 ms fixture delay was traced as `refresh ok generation=1 coins=100 duration=265ms`. Full procedure and outputs are in `.omo/evidence/M4-04-measurements.md`. Gates after implementation: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (102 unit + 31 provider), and `cargo build --locked` all pass.
 
 Quality gate `G4`:
 
-- [ ] All M4 tasks are accepted and required checks pass.
-- [ ] Ten consecutive start/refresh/quit cycles restore the terminal.
-- [ ] Offline startup, DNS failure, timeout, malformed response, `429`, and `500` scenarios show the documented state.
-- [ ] No secrets appear in screen output, test artifacts, or trace logs.
+- [x] All M4 tasks are accepted and required checks pass.
+  Evidence: `M4-01` through `M4-04` are accepted, and the final M4 baseline `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features` (102 unit + 31 provider), and locked debug and release builds all pass on Rust 1.97.1.
+- [x] Ten consecutive start/refresh/quit cycles restore the terminal.
+  Evidence: `scripts/cycle-restore.sh` ran 10 cycles of the release binary in a detached 80x24 tmux pane against `scripts/fixture-server.py`: every cycle reached a successful refresh, answered `r` then `q`, and the restored pane showed the shell's `cycle-done-N` marker with no leftover app UI (`q quit` absent): 10 passed, 0 failed.
+- [x] Offline startup, DNS failure, timeout, malformed response, `429`, and `500` scenarios show the documented state.
+  Evidence: `scripts/scenario-check.sh` ran each scenario in a detached 80x24 pane and matched the `PRODUCT.md` wording: offline startup (`http://closed-loopback`, `Offline: no market data is available; press r to retry`), DNS failure (`https://does-not-exist.invalid/`, same OFFLINE message), malformed response (fixture serving non-JSON, `Error: invalid provider response; press r to retry`), `429` with `Retry-After: 5` (`RATE LIMITED` body `Rate limited: ...`), `500` (`Error: provider request failed; press r to retry`), and timeout (fixture holding the markets response past the 30s client window, OFFLINE message) all passed. The `fixture-server.py` `--mode` flag (ok/malformed/rate-limited/server-error/timeout) backs these offline runs.
+- [x] No secrets appear in screen output, test artifacts, or trace logs.
+  Evidence: running with `COIN_TUI_API_KEY=pragma-gate-secret` produced zero occurrences of the key in the tmux pane capture, the `COIN_TUI_LOG_FILE` trace, or the measurement report, and a repo sweep found none; automated coverage remains (`hostile_provider_fixtures_never_corrupt_the_terminal_or_leak_the_key`, `secret_bearing_rate_limit_and_server_errors_are_redacted`, `omits_key_and_classifies_failures_without_secret_in_display`, and the `FileLog` redaction unit tests).
 
 ## M5: Release Candidate
 

@@ -628,6 +628,7 @@ pub struct Controller<P: MarketData + ?Sized> {
     results: mpsc::Receiver<Event>,
     cancellation: CancellationToken,
     active: Option<JoinHandle<()>>,
+    refresh_started_at: Option<Instant>,
     tracer: Option<FileLog>,
     pub app: App,
 }
@@ -655,6 +656,7 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
             results,
             cancellation: CancellationToken::new(),
             active: None,
+            refresh_started_at: None,
             tracer,
             app: App::with_refresh_interval(interval),
         }
@@ -677,6 +679,7 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
     }
 
     fn start_fetch(&mut self, generation: u64) {
+        self.refresh_started_at = Some(Instant::now());
         self.trace(format!("refresh start generation={generation}"));
         let provider = Arc::clone(&self.provider);
         let sender = self.events.clone();
@@ -694,20 +697,28 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
     }
 
     pub async fn handle(&mut self, event: Event) -> Command {
-        let trace_line = match &event {
-            Event::FetchResult { generation, result } => Some(match result {
-                Ok(outcome) => format!(
-                    "refresh ok generation={generation} coins={}",
-                    outcome.snapshot.coins().len()
-                ),
-                Err(error) => format!("refresh failed generation={generation} error={error}"),
-            }),
+        let fetch_result = match &event {
+            Event::FetchResult { generation, result } => Some((*generation, result.clone())),
             _ => None,
         };
         let command = self.app.update(event);
-        if let Some(trace_line) = trace_line {
+        if let Some((generation, result)) = fetch_result {
             if !matches!(command, Command::None) {
-                self.trace(trace_line);
+                let elapsed_ms = self
+                    .refresh_started_at
+                    .take()
+                    .map(|started| started.elapsed().as_millis())
+                    .unwrap_or(0);
+                let line = match result {
+                    Ok(outcome) => format!(
+                        "refresh ok generation={generation} coins={} duration={elapsed_ms}ms",
+                        outcome.snapshot.coins().len()
+                    ),
+                    Err(error) => format!(
+                        "refresh failed generation={generation} duration={elapsed_ms}ms error={error}"
+                    ),
+                };
+                self.trace(line);
             }
         }
         if let Command::Fetch { generation } = command {
@@ -822,12 +833,26 @@ where
 {
     let mut controller = Controller::with_interval(provider, tracer, refresh_interval);
     let session_log = controller.tracer.clone();
+    let render_tracer = session_log.clone();
     let loop_result = async {
         controller.start_initial_refresh();
         if let Some(log) = &session_log {
             log.trace("info", "session start");
         }
-        render(&controller.app)?;
+        let mut draw = move |app: &App| {
+            let started = std::time::Instant::now();
+            let result = render(app);
+            if let Some(log) = &render_tracer {
+                if result.is_ok() {
+                    log.info(&format!(
+                        "render ok duration={}ms",
+                        started.elapsed().as_millis()
+                    ));
+                }
+            }
+            result
+        };
+        draw(&controller.app)?;
         // Low-frequency tick: refreshes relative timestamps, re-renders, and
         // lets the refresh scheduler start automatic refreshes. The first
         // tick is delayed so startup is not double-rendered.
@@ -855,10 +880,10 @@ where
                     return Ok(());
                 }
                 Command::Render => {
-                    render(&controller.app)?;
+                    draw(&controller.app)?;
                 }
                 Command::Fetch { .. } => {
-                    render(&controller.app)?;
+                    draw(&controller.app)?;
                 }
                 Command::None => {}
             }
@@ -1852,6 +1877,86 @@ mod tests {
         task.await.unwrap_err();
     }
 
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn idle_rendering_is_event_driven_and_steady() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let rendered = Arc::clone(&renders);
+        let task = tokio::spawn(run_loop_with_sources(
+            Arc::new(CountingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            stream::pending::<Result<CrosstermEvent, io::Error>>(),
+            move |_| {
+                rendered.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        ));
+        // Let startup settle: the initial render, the completed fetch result
+        // render, and the first tick. Nothing idle should render between
+        // events except the low-frequency tick.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let settled = renders.load(Ordering::Relaxed);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let first_window = renders.load(Ordering::Relaxed).saturating_sub(settled);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let second_window = renders
+            .load(Ordering::Relaxed)
+            .saturating_sub(settled + first_window);
+
+        // A 1 Hz idle tick means ~30 renders per 30-second window, not tens
+        // of thousands per second. A hot loop would blow these bounds.
+        assert!(
+            (26..=36).contains(&first_window),
+            "first 30s idle rendered {first_window} times"
+        );
+        assert!(
+            (26..=36).contains(&second_window),
+            "second 30s idle rendered {second_window} times"
+        );
+        assert!(
+            first_window.abs_diff(second_window) <= 10,
+            "idle rendering stays steady: {first_window} vs {second_window}"
+        );
+        assert!(
+            renders.load(Ordering::Relaxed) - settled <= 72,
+            "60s idle rendered far more than the tick cadence"
+        );
+        task.abort();
+        task.await.unwrap_err();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_duration_is_recorded_in_the_trace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("timing.log");
+        let tracer = Some(FileLog::append_at(&path, Vec::new()).unwrap());
+        run_loop_with_sources_and_tracer(
+            Arc::new(CountingProvider {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            eof_after(Duration::from_millis(50)),
+            |_| Ok(()),
+            tracer,
+            Duration::from_secs(crate::config::DEFAULT_REFRESH_SECONDS),
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("refresh ok generation=1 coins=1"),
+            "{content}"
+        );
+        let has_duration = content
+            .lines()
+            .any(|line| line.contains("refresh ok") && line.contains("duration="));
+        assert!(has_duration, "refresh ok lines carry a duration: {content}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn hostile_provider_fixtures_never_corrupt_the_terminal_or_leak_the_key() {
         let key = "super-secret-api-key";
@@ -1973,9 +2078,11 @@ mod tests {
         .await;
         assert!(result.is_ok());
         let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("refresh failed generation=1"), "{content}");
+        assert!(content.contains("error=API transport failed"), "{content}");
         assert!(
-            content.contains("refresh failed generation=1 error=API transport failed"),
-            "{content}"
+            content.contains("duration="),
+            "refresh timing is recorded in the trace: {content}"
         );
         assert!(
             !content.contains(key),

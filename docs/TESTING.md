@@ -56,6 +56,10 @@ Fixtures contain no credentials, personal data, full production payloads, or unn
 
 Use paused Tokio time for refresh scheduling, cooldown, retry, and capped backoff. Prove that delayed HTTP work does not block input, only one refresh runs at a time, stale data survives refresh failure, and cancellation joins background tasks.
 
+### Performance Measurement
+
+Prove idle rendering is event-driven and record the idle CPU of a release run. Over a 60-second idle window the loop re-renders once per second at most (paused-time test `idle_rendering_is_event_driven_and_steady` counts ~30 renders per 30 seconds), and a release run sampled with `ps -o %cpu=` stays near zero. Use `scripts/measure-idle.sh` for the reproducible report: it builds `--release --locked`, runs against the loopback fixture server, samples CPU, and reads the traced `render ok` cadence and `refresh ok ... duration=` lines. Record a delayed-mock refresh timing run (`FIXTURE_DELAY_MS=250`), and record the observed idle CPU and refresh duration in the `ROADMAP.md` evidence as this task does.
+
 ### Terminal Lifecycle
 
 Automate terminal setup logic where practical. Manually verify normal exit, `Ctrl-C`, startup error, runtime error, and panic. Each path must restore echo, cursor visibility, canonical input, and the previous screen.
@@ -70,7 +74,12 @@ At each UI quality gate, run the keyboard-only path from `PRODUCT.md` with fixtu
 - loading, stale, offline, rate-limited, empty, and fatal states;
 - ten consecutive start, refresh, and quit cycles before release.
 
-Record the terminal, dimensions, data source, result, and defects in the relevant `ROADMAP.md` evidence line.
+Running the gates is scripted: `scripts/measure-idle.sh` (idle CPU and traced
+timing), `scripts/cycle-restore.sh` (ten start/refresh/quit cycles), and
+`scripts/scenario-check.sh` (offline, DNS, timeout, malformed, `429`, and `500`
+states), all against `scripts/fixture-server.py`. Record the terminal,
+dimensions, data source, result, and defects in the relevant `ROADMAP.md`
+evidence line.
 
 ## Release Suite
 

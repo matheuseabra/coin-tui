@@ -139,7 +139,11 @@ A `RefreshScheduler` in `App` owns the only refresh cadence. A success marks `ne
 
 ### Redacted File Tracing
 
-When `COIN_TUI_LOG_FILE` is set, a shared `FileLog` (`src/log.rs`) appends timestamped diagnostic lines to that file. It is written outside the alternate screen and is always best-effort: a poison-ed lock or failed write never takes the application down. The API key is registered as a redaction secret, and every line is scrubbed before a single byte reaches disk, so even an accidental caption cannot spill it. The refresh lifecycle emits compact events: `session start`, `refresh start generation=N`, `refresh ok generation=N coins=M`, `refresh failed generation=N error=<redacted>`, and `loop stopped success=true`. Errors use `ApiError`'s redacting `Display`, which never echoes a response body, so hostile or oversized bodies cannot leak their contents into the file.
+When `COIN_TUI_LOG_FILE` is set, a shared `FileLog` (`src/log.rs`) appends timestamped diagnostic lines to that file. It is written outside the alternate screen and is always best-effort: a poison-ed lock or failed write never takes the application down. The API key is registered as a redaction secret, and every line is scrubbed before a single byte reaches disk, so even an accidental caption cannot spill it. The refresh lifecycle emits compact events: `session start`, `refresh start generation=N`, `refresh ok generation=N coins=M duration=NNNms`, `refresh failed generation=N duration=NNNms error=<redacted>`, a `render ok duration=NNNms` line per draw, and `loop stopped success=true`. Durations make idle and refresh behavior observable from the trace, so the trace doubles as the performance record for `M4-04`. Errors use `ApiError`'s redacting `Display`, which never echoes a response body, so hostile or oversized bodies cannot leak their contents into the file.
+
+### Performance Measurement
+
+The idle loop is event-driven: it parks on `tokio::select!` over input, fetch results, and a one-second tick, and re-renders only when an event arrives; it never draws at a fixed high frame rate. `scripts/fixture-server.py` is a loopback CoinGecko-compatible mock serving small sanitized JSON for offline manual runs, and `scripts/measure-idle.sh` samples the idle CPU of a release run and reports the traced render/refresh cadence. Nothing in `scripts/` is part of the application build; it is a measurement harness only. `TESTING.md` defines the measurement procedure.
 
 Provider verification and fixture rules are defined in `TESTING.md`.
 
