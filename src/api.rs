@@ -14,6 +14,8 @@ const MARKETS_PATH: &str = "api/v3/coins/markets";
 const GLOBAL_PATH: &str = "api/v3/global";
 const COINS_PATH: &str = "api/v3/coins";
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Days of history for the detail candlestick chart's price series.
+const MARKET_CHART_DAYS: &str = "30";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApiError {
@@ -136,6 +138,26 @@ impl CoinGeckoClient {
             )
             .await?;
         convert_detail(coin)
+    }
+
+    /// Price history for the detail chart (`GET /coins/{id}/market_chart`),
+    /// `days=30`, so the candlestick chart has enough candles to stretch the
+    /// pane. Returns just the `prices` series as (timestamp, price) pairs.
+    pub async fn fetch_market_chart(&self, id: &str) -> Result<Vec<f64>, ApiError> {
+        let mut url = self.coin_detail_url(id)?;
+        url.path_segments_mut()
+            .map_err(|_| ApiError::InvalidBaseUrl)?
+            .push("market_chart");
+        let chart: CoinGeckoMarketChart = self
+            .request_url(url, &[("vs_currency", "usd"), ("days", MARKET_CHART_DAYS)])
+            .await?;
+        Ok(chart
+            .prices
+            .into_iter()
+            .filter_map(|pair| pair.into_iter().nth(1))
+            .flatten()
+            .filter(|value| value.is_finite())
+            .collect())
     }
 
     /// Percent-encode the coin id into a `/coins/{id}` URL so a hostile id
@@ -275,6 +297,16 @@ pub trait MarketData: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<CoinDetail, ApiError>> + Send + 'a>> {
         Box::pin(async move { Err(ApiError::HttpStatus { status: 501 }) })
     }
+
+    /// Price history for the detail chart. The default is unsupported, like
+    /// `fetch_coin_detail`; the detail chart then falls back to the snapshot's
+    /// 7-day series.
+    fn fetch_market_chart<'a>(
+        &'a self,
+        _id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f64>, ApiError>> + Send + 'a>> {
+        Box::pin(async move { Err(ApiError::HttpStatus { status: 501 }) })
+    }
 }
 
 impl MarketData for CoinGeckoClient {
@@ -289,6 +321,13 @@ impl MarketData for CoinGeckoClient {
         id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<CoinDetail, ApiError>> + Send + 'a>> {
         Box::pin(CoinGeckoClient::fetch_coin_detail(self, id))
+    }
+
+    fn fetch_market_chart<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<f64>, ApiError>> + Send + 'a>> {
+        Box::pin(CoinGeckoClient::fetch_market_chart(self, id))
     }
 }
 
@@ -496,6 +535,14 @@ fn convert_detail(coin: CoinGeckoCoin) -> Result<CoinDetail, ApiError> {
 #[derive(Deserialize)]
 struct Sparkline {
     price: Option<Vec<Option<f64>>>,
+}
+
+/// `GET /coins/{id}/market_chart` response: `prices` is a list of
+/// `[timestamp, price]` pairs; `market_caps` and `total_volumes` are unused.
+#[derive(Deserialize)]
+struct CoinGeckoMarketChart {
+    #[serde(default)]
+    prices: Vec<Vec<Option<f64>>>,
 }
 
 #[derive(Deserialize)]

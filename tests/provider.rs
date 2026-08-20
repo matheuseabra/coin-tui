@@ -962,6 +962,52 @@ async fn fetch_coin_detail_requests_exact_path_query_and_key_and_converts() {
 }
 
 #[tokio::test]
+async fn fetch_market_chart_requests_path_query_and_key_and_extracts_prices() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/bitcoin/market_chart"))
+        .and(query_param("vs_currency", "usd"))
+        .and(query_param("days", "30"))
+        .and(header("x-cg-demo-api-key", "secret-key"))
+        .respond_with(json(
+            r#"{"prices":[[1700000000000,50000],[1700036400000,51000],[1700072400000,null],[1700108400000,52000]],"market_caps":[],"total_volumes":[]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let prices = client(&server, Some("secret-key".into()))
+        .fetch_market_chart("bitcoin")
+        .await
+        .unwrap();
+    assert_eq!(
+        prices,
+        vec![50000.0, 51000.0, 52000.0],
+        "null prices are dropped"
+    );
+
+    // The MarketData trait exposes the same method for object-safe providers.
+    let keyed = client(&server, Some("secret-key".into()));
+    let chart = api::MarketData::fetch_market_chart(&keyed, "bitcoin").await;
+    assert!(chart.is_ok());
+}
+
+#[tokio::test]
+async fn fetch_market_chart_percent_encodes_hostile_ids() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/coins/..%2Fadmin/market_chart"))
+        .respond_with(json(r#"{"prices":[],"market_caps":[],"total_volumes":[]}"#))
+        .mount(&server)
+        .await;
+
+    let prices = client(&server, None)
+        .fetch_market_chart("../admin")
+        .await
+        .unwrap();
+    assert!(prices.is_empty());
+}
+
+#[tokio::test]
 async fn fetch_coin_detail_percent_encodes_hostile_ids_and_rejects_missing_market_data() {
     let server = MockServer::start().await;
     // A hostile id cannot smuggle extra path segments or query text.

@@ -41,6 +41,11 @@ pub enum Event {
         generation: u64,
         result: Result<Box<CoinDetail>, ApiError>,
     },
+    ChartResult {
+        id: String,
+        generation: u64,
+        result: Result<Vec<f64>, ApiError>,
+    },
     NewsResult {
         generation: u64,
         result: Result<Vec<NewsItem>, ApiError>,
@@ -87,16 +92,19 @@ pub enum DataState {
 /// The coin detail screen. `Enter` always opens with the snapshot row
 /// (`Basic`) so the pane renders instantly offline; an optional
 /// `/coins/{id}` fetch upgrades it to `Ready`, and a failed fetch keeps it
-/// on the row-derived fallback.
+/// on the row-derived fallback. `Ready` also carries the optional 30-day
+/// price series for the candlestick chart when the market-chart fetch lands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DetailState {
     Basic(CoinMarket),
     Loading {
         base: CoinMarket,
+        chart_30d: Vec<f64>,
     },
     Ready {
         base: CoinMarket,
         detail: Box<CoinDetail>,
+        chart_30d: Vec<f64>,
     },
 }
 
@@ -104,7 +112,7 @@ impl DetailState {
     pub fn base(&self) -> &CoinMarket {
         match self {
             DetailState::Basic(base)
-            | DetailState::Loading { base }
+            | DetailState::Loading { base, .. }
             | DetailState::Ready { base, .. } => base,
         }
     }
@@ -112,8 +120,19 @@ impl DetailState {
     fn update_base(&mut self, base: CoinMarket) {
         match self {
             DetailState::Basic(current)
-            | DetailState::Loading { base: current }
+            | DetailState::Loading { base: current, .. }
             | DetailState::Ready { base: current, .. } => *current = base,
+        }
+    }
+
+    /// The optional 30-day price series for the candlestick chart, empty when
+    /// the market-chart fetch has not landed or is unsupported.
+    pub fn chart_30d(&self) -> &[f64] {
+        match self {
+            DetailState::Loading { chart_30d, .. } | DetailState::Ready { chart_30d, .. } => {
+                chart_30d
+            }
+            DetailState::Basic(_) => &[],
         }
     }
 }
@@ -147,6 +166,7 @@ pub struct App {
     help_open: bool,
     detail: Option<DetailState>,
     detail_fetching: bool,
+    chart_fetching: bool,
     detail_generation: u64,
     detail_id: Option<String>,
     news: Option<NewsFeed>,
@@ -392,6 +412,7 @@ impl App {
             help_open: false,
             detail: None,
             detail_fetching: false,
+            chart_fetching: false,
             detail_generation: 0,
             detail_id: None,
             news: None,
@@ -485,7 +506,10 @@ impl App {
                     .get(self.selected)
                     .map(|coin| (*coin).clone())
                 {
-                    self.detail = Some(DetailState::Loading { base: coin.clone() });
+                    self.detail = Some(DetailState::Loading {
+                        base: coin.clone(),
+                        chart_30d: Vec::new(),
+                    });
                     self.begin_detail_fetch(coin.id())
                 } else {
                     Command::None
@@ -576,23 +600,58 @@ impl App {
                     return Command::None;
                 }
                 self.detail_fetching = false;
-                self.detail_id = None;
                 match result {
                     Ok(detail) => {
                         let upgrade = matches!(
                             &self.detail,
-                            Some(DetailState::Loading { base }) if base.id() == id
+                            Some(DetailState::Loading { base, .. }) if base.id() == id
                         );
                         if upgrade {
-                            if let Some(DetailState::Loading { base }) = self.detail.take() {
-                                self.detail = Some(DetailState::Ready { base, detail });
+                            if let Some(DetailState::Loading { base, chart_30d }) =
+                                self.detail.take()
+                            {
+                                self.detail = Some(DetailState::Ready {
+                                    base,
+                                    detail,
+                                    chart_30d,
+                                });
                             }
                         }
                     }
                     Err(_) => {
-                        if let Some(DetailState::Loading { base }) = self.detail.take() {
+                        if let Some(DetailState::Loading { base, .. }) = self.detail.take() {
                             self.detail = Some(DetailState::Basic(base));
                         }
+                    }
+                }
+                Command::Render
+            }
+            Event::ChartResult {
+                id,
+                generation,
+                result,
+            } => {
+                if !self.chart_fetching || generation != self.detail_generation {
+                    return Command::None;
+                }
+                self.chart_fetching = false;
+                self.detail_id = None;
+                if let Ok(series) = result {
+                    match self.detail.take() {
+                        Some(DetailState::Ready { base, detail, .. }) if base.id() == id => {
+                            self.detail = Some(DetailState::Ready {
+                                base,
+                                detail,
+                                chart_30d: series,
+                            });
+                        }
+                        Some(DetailState::Loading { base, .. }) if base.id() == id => {
+                            self.detail = Some(DetailState::Loading {
+                                base,
+                                chart_30d: series,
+                            });
+                        }
+                        other => self.detail = other,
                     }
                 }
                 Command::Render
@@ -673,6 +732,7 @@ impl App {
             return Command::None;
         }
         self.detail_fetching = true;
+        self.chart_fetching = true;
         self.detail_id = Some(id.to_owned());
         self.detail_generation = self.detail_generation.wrapping_add(1);
         Command::FetchDetail {
@@ -684,6 +744,7 @@ impl App {
     /// Invalidate any in-flight detail fetch (used when the detail closes).
     fn cancel_detail_fetch(&mut self) {
         self.detail_fetching = false;
+        self.chart_fetching = false;
         self.detail_id = None;
         self.detail_generation = self.detail_generation.wrapping_add(1);
     }
@@ -1040,9 +1101,23 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         let provider = Arc::clone(&self.provider);
         let sender = self.events.clone();
         let cancelled = self.cancellation.clone();
+        let chart_id = id.clone();
         self.spawn(tokio::spawn(async move {
             tokio::select! {
                 result = provider.fetch_coin_detail(&id) => { let _ = sender.send(Event::DetailResult { id, generation, result: result.map(Box::new) }).await; }
+                _ = cancelled.cancelled() => {}
+            }
+        }));
+        // The 30-day price series for the candlestick chart is a separate
+        // provider call, chained onto the same detail fetch so the chart
+        // stretches once it lands (and falls back to the 7-day series when it
+        // is unsupported or fails).
+        let provider = Arc::clone(&self.provider);
+        let sender = self.events.clone();
+        let cancelled = self.cancellation.clone();
+        self.spawn(tokio::spawn(async move {
+            tokio::select! {
+                result = provider.fetch_market_chart(&chart_id) => { let _ = sender.send(Event::ChartResult { id: chart_id, generation, result }).await; }
                 _ = cancelled.cancelled() => {}
             }
         }));
@@ -1404,10 +1479,11 @@ fn navigation_key(code: KeyCode) -> bool {
 }
 
 /// Rows a table can show below its header for a given terminal height: the
-/// summary block (3), status line (1), and the bordered table header (2 + 1).
-/// PageUp/PageDown move by this viewport.
+/// summary block (3), status line (1), and the bordered table header (2 +
+/// header row), with each row taking 2 lines. PageUp/PageDown move by this
+/// viewport.
 fn table_viewport(height: u16) -> usize {
-    height.saturating_sub(7).max(1) as usize
+    height.saturating_sub(7).div_ceil(2).max(1) as usize
 }
 
 #[cfg(test)]
@@ -1780,7 +1856,7 @@ mod tests {
         let mut app = ready_app(100);
         app.update(Event::Resize { height: 24 });
         let viewport = table_viewport(24);
-        assert_eq!(viewport, 17, "24-row terminal shows 17 table rows");
+        assert_eq!(viewport, 9, "24-row terminal shows 9 table rows");
         assert!(is_render(nav(&mut app, KeyCode::PageDown)));
         assert_eq!(app.selected(), viewport, "PageDown advances one viewport");
         assert!(is_render(nav(&mut app, KeyCode::PageDown)));
@@ -1824,10 +1900,10 @@ mod tests {
     fn viewport_has_a_floor_and_resize_updates_it() {
         assert_eq!(table_viewport(0), 1);
         assert_eq!(table_viewport(5), 1);
-        assert_eq!(table_viewport(60), 53);
+        assert_eq!(table_viewport(60), 27);
         let mut app = ready_app(10);
         app.update(Event::Resize { height: 30 });
-        assert_eq!(table_viewport(30), 23);
+        assert_eq!(table_viewport(30), 12);
         assert!(is_render(nav(&mut app, KeyCode::PageDown)));
         assert_eq!(app.selected(), 9, "PageDown clamps to the row count");
     }
@@ -3367,6 +3443,69 @@ mod tests {
         assert!(
             matches!(app.detail_state(), Some(DetailState::Ready { .. })),
             "a stale result never downgrades a Ready pane"
+        );
+    }
+
+    #[test]
+    fn chart_result_upgrades_the_30_day_series_in_any_arrival_order() {
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row(
+            "bitcoin", 1, "Bitcoin", "BTC",
+        )]));
+        let Command::FetchDetail { id, generation } = app.update(Event::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!("Enter must open the detail and start the rich fetch")
+        };
+        assert_eq!(id, "bitcoin");
+
+        // The chart series lands before the rich detail: it is carried on the
+        // Loading state, then preserved when the detail upgrades to Ready.
+        app.update(Event::ChartResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Ok((0..720).map(|i| 1000.0 + i as f64).collect()),
+        });
+        assert_eq!(
+            app.detail_state().unwrap().chart_30d().len(),
+            720,
+            "chart series stored on Loading"
+        );
+        app.update(Event::DetailResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Ok(Box::new(rich_detail())),
+        });
+        let state = app.detail_state().unwrap();
+        assert_eq!(
+            state.chart_30d().len(),
+            720,
+            "chart series survives the upgrade"
+        );
+
+        // A failed chart fetch leaves the pane on the 7-day fallback.
+        let mut app = loaded_app(mixed_snapshot(vec![coin_row(
+            "bitcoin", 1, "Bitcoin", "BTC",
+        )]));
+        let Command::FetchDetail { generation, .. } = app.update(Event::Input(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))) else {
+            panic!()
+        };
+        app.update(Event::DetailResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Ok(Box::new(rich_detail())),
+        });
+        app.update(Event::ChartResult {
+            id: "bitcoin".to_owned(),
+            generation,
+            result: Err(ApiError::Transport),
+        });
+        assert!(
+            app.detail_state().unwrap().chart_30d().is_empty(),
+            "failed chart fetch keeps the 7-day fallback"
         );
     }
 

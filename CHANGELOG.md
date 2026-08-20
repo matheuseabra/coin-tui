@@ -9,6 +9,14 @@ for [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 First release candidate. The application surface is complete; this section will
 become the `0.1.0` changelog on the first tagged release.
 
+### Changed
+
+- The coin-detail chart is a candlestick chart rendered by the `chandelier` library from derived daily open/high/low/close candles; it upgrades to a 30-day view from the `/coins/{id}/market_chart` endpoint when available and falls back to the 7-day series otherwise.
+- The table's 7-day trend column keeps the compact inline block-glyph sparkline (the Ratatui `Sparkline` widget experiment was rolled back).
+- The table row highlight is a clean, gap-free block: the selected row's text and breathing lines are both highlighted edge to edge.
+- At 162+ columns the body splits 70/30 — table 70%, news/sentiment 30% — with the right column divided into two equal rows.
+- Upgraded `ratatui` to 0.30 (with the `crossterm_0_29` feature) and `crossterm` to 0.29 to support the candlestick library.
+
 ### Added
 
 - Compact global market summary: market cap, 24-hour volume, BTC dominance, and 24-hour change.

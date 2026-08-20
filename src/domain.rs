@@ -379,6 +379,62 @@ fn normalize_coin(coin: CoinMarketInput) -> CoinMarket {
     }
 }
 
+/// An open/high/low/close bar derived from the hourly 7-day price series.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Candle {
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+}
+
+/// Bound the number of derived daily candles so a hostile hourly series can
+/// never produce an unbounded chart. A 30-day hourly series yields at most
+/// thirty daily candles.
+pub const MAX_DAILY_CANDLES: usize = 30;
+
+/// Hourly points in one day; `daily_candles` buckets by this granularity.
+const HOURLY_POINTS_PER_DAY: usize = 24;
+
+/// Aggregate the finite hourly closes into daily candles: the first point of a
+/// bucket is the open, the max is the high, the min is the low, and the last
+/// point is the close. A day is 24 hourly points, so a 30-day series yields
+/// thirty candles (capped at `MAX_DAILY_CANDLES`); fewer points collapse into
+/// fewer candles (a flat or tiny series becomes one flat candle that a chart
+/// renders as a mid-line). Non-finite points are dropped (matching the domain
+/// boundary); an empty or all-non-finite series yields no candles.
+pub fn daily_candles(series: &[f64]) -> Vec<Candle> {
+    let values: Vec<f64> = series
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.is_empty() {
+        return Vec::new();
+    }
+    // One bucket per 24 hourly points (a day), capped so hostile series stay
+    // bounded; anything shorter than a day becomes a single candle.
+    let days = values
+        .len()
+        .div_ceil(HOURLY_POINTS_PER_DAY)
+        .min(MAX_DAILY_CANDLES);
+    let bucket_size = values.len().div_ceil(days);
+    let mut candles = Vec::with_capacity(days);
+    for chunk in values.chunks(bucket_size) {
+        let open = chunk[0];
+        let close = *chunk.last().unwrap();
+        let high = chunk.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let low = chunk.iter().copied().fold(f64::INFINITY, f64::min);
+        candles.push(Candle {
+            open,
+            high,
+            low,
+            close,
+        });
+    }
+    candles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,5 +690,81 @@ mod tests {
         assert_eq!(snapshot.provider_updated_at(), timestamp);
         assert!(fixture_snapshot(r#"{"summary":{},"coins":[{"id":1}]}"#).is_err());
         assert!(fixture_snapshot(r#"{"summary":{},"coins":[{"id":"x","rank":4294967296,"name":"x","symbol":"x","sparkline_7d":[] }]}"#).is_err());
+    }
+
+    #[test]
+    fn daily_candles_aggregate_hourly_closes_into_ohlc() {
+        // One week of hourly points, so every hour maps to one of seven days.
+        let week: Vec<f64> = (0..168).map(|hour| hour as f64).collect();
+        let candles = daily_candles(&week);
+        assert_eq!(candles.len(), 7, "one candle per day");
+        assert_eq!(
+            candles[0],
+            Candle {
+                open: 0.0,
+                high: 23.0,
+                low: 0.0,
+                close: 23.0
+            }
+        );
+        assert_eq!(
+            candles[6],
+            Candle {
+                open: 144.0,
+                high: 167.0,
+                low: 144.0,
+                close: 167.0
+            }
+        );
+        for candle in &candles {
+            assert!(candle.low <= candle.open && candle.low <= candle.close);
+            assert!(candle.high >= candle.open && candle.high >= candle.close);
+        }
+    }
+
+    #[test]
+    fn daily_candles_bounded_flat_empty_and_hostile_series() {
+        // A long series caps at MAX_DAILY_CANDLES.
+        let long: Vec<f64> = (0..1000).map(|index| index as f64).collect();
+        assert_eq!(daily_candles(&long).len(), MAX_DAILY_CANDLES);
+
+        // A flat series collapses to one flat candle (a chart mid-line).
+        assert_eq!(
+            daily_candles(&[5.0, 5.0, 5.0]),
+            vec![Candle {
+                open: 5.0,
+                high: 5.0,
+                low: 5.0,
+                close: 5.0
+            }]
+        );
+
+        // A single point is one flat candle.
+        assert_eq!(
+            daily_candles(&[7.0]),
+            vec![Candle {
+                open: 7.0,
+                high: 7.0,
+                low: 7.0,
+                close: 7.0
+            }]
+        );
+
+        // Empty and all-non-finite series have nothing to plot.
+        assert!(daily_candles(&[]).is_empty());
+        assert!(daily_candles(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).is_empty());
+
+        // Non-finite points are dropped before bucketing.
+        let mixed = daily_candles(&[f64::NAN, 1.0, 2.0, f64::INFINITY, 3.0]);
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(
+            mixed[0],
+            Candle {
+                open: 1.0,
+                high: 3.0,
+                low: 1.0,
+                close: 3.0
+            }
+        );
     }
 }

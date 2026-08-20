@@ -220,6 +220,42 @@ Quality gate `G6`:
 - [ ] The baseline checks in `docs/TESTING.md` pass with the new screens and feeds.
 - [ ] Manual checks confirm each new surface at compact, standard, and full widths, readable without color.
 
+## M7: Library-Driven Charts And Table Polish
+
+Goal: render the coin-detail chart with the `chandelier` candlestick library on
+a 30-day view, restore the compact inline trend sparkline, and add breathing
+room between the table header and rows.
+
+- [x] `M7-01` Upgrade ratatui to 0.30 and crossterm to 0.29.
+  Depends on: `G6`.
+  Acceptance: the app builds and passes the full baseline suite on the new stack; the `crossterm_0_29` ratatui feature keeps the re-exported Crossterm matching the direct dependency.
+  Evidence: `Cargo.toml` pins `ratatui = { version = "0.30", features = ["crossterm_0_29"] }` and `crossterm = { version = "0.29", features = ["event-stream"] }`; the only code change the migration required was removing the now-unused `prelude::Stylize` import in `src/ui.rs` (0.30 removed `Styled` from `Style`). `cargo test --all-features` passes 192 tests (145 unit + 47 provider) unchanged on the new stack, and fmt/clippy are clean.
+- [x] `M7-02` Restore the compact inline trend sparkline.
+  Depends on: `M7-01`.
+  Acceptance: full-mode rows show the original block-glyph 7-day trend, colored by the 7-day change sign, with a dash for missing or all-non-finite series; every required width renders without out-of-bounds.
+  Evidence: `sparkline_text` in `src/ui.rs` renders the finite hourly closes downsampled into `width` equal averaged buckets, min-max normalized into the eight block glyphs `▁▂▃▄▅▆▇█`, with a flat series at mid level (`▄`) and `-` for missing; `make_cell` colors it via `cell_style` by the 7-day change sign. The ratatui `Sparkline` widget experiment was rolled back after visual review showed it could not fill the fixed-width trend cell. Tests restore the exact glyph assertions for flat/rising/falling/single-point/missing/non-finite/zero-width series and full-mode rendering.
+- [x] `M7-03` Render the coin-detail chart with the `chandelier` candlestick library on a 30-day view.
+  Depends on: `M7-01`.
+  Acceptance: the detail chart is a candlestick chart drawn from daily OHLC candles, styled with the theme's gain/loss/trend roles, readable without color, bounded against hostile/empty/long series, and stretching the full content column.
+  Evidence: `CoinGeckoClient::fetch_market_chart` (`GET /coins/{id}/market_chart?days=30`) is a new provider boundary (`MarketData::fetch_market_chart`, default unsupported) that returns the 30-day price series; the controller chains it onto the detail fetch and `Event::ChartResult` carries it through `DetailState::Loading`/`Ready` (either fetch may land first). `daily_candles` in `src/domain.rs` derives up to `MAX_DAILY_CANDLES = 30` daily candles (one per 24 hourly points) and `render_detail_chart` sizes the `chandelier::CandlestickChart` candles via `candle_width` so they stretch the `DETAIL_CONTENT_WIDTH = 56` column; when the market chart is unsupported or fails, the chart falls back to the 7-day series and the caption reads `7 days` instead of `30 days`. Tests cover the provider request path/query/key/hostile-id encoding, the chart-series upgrade in either arrival order, the derived OHLC bounds, empty/non-finite series, theme-role styling, and rendering at 60x16/80x24/120x30.
+- [x] `M7-04` Keep the table row highlight a clean, gap-free block.
+  Depends on: `M7-01`.
+  Acceptance: the selected-row highlight fills the row's full block (text line + breathing line) with no gap above or between; the header sits directly above the first row.
+  Evidence: `make_row` in `src/ui.rs` uses plain `Row::height(2)` (no header `bottom_margin`, no row `top_margin`), so ratatui's `row_highlight_style` paints the whole 2-line row area. The earlier `header.bottom_margin(1)` and `row.top_margin(1)` attempts both left the margin line outside the highlighted `row_area` (ratatui's `row_area` starts below the margin), which is what created and then widened the gap; both were reverted. A 80x20 tmux capture with ANSI codes shows the selected row's text and breathing lines both `reversed`, edge to edge, with no gap.
+- [x] `M7-05` Split the default body layout 70/30 with equal news and sentiment rows.
+  Depends on: `M7-01`.
+  Acceptance: at 162+ columns the body splits 70% table / 30% right column, and the right column splits into two equal rows (news on top, sentiment below); below 162 columns one focused pane still replaces the table.
+  Evidence: `render_market` in `src/ui.rs` now uses `[Percentage(70), Percentage(30)]` for the horizontal split and `[Percentage(50), Percentage(50)]` for the right column; the fixed `SIDE_COLUMN = 42` constant was removed. A 200x40 tmux capture shows the table at ~140 columns with the full column set and the news/sentiment panes side-by-side in the ~60-column right rail.
+- [x] `M7-06` Manual verification of the charts and table across widths and themes.
+  Depends on: `M7-02`, `M7-03`, `M7-04`, `M7-05`.
+  Acceptance: a fixture-backed walkthrough shows the inline trend sparkline in full mode, the 30-day candlestick chart on the detail screen at compact, standard, and full widths, the gap-free row highlight, and the 70/30 layout, cycling every theme with `NO_COLOR=1` readable.
+  Evidence: a 200x40 tmux run against `scripts/fixture-server.py` (loopback port 8152) showed the full-mode Trend column rendering block glyphs, the selected row's 3-line reversed highlight with no gap, the 70/30 body with news/sentiment in the right rail, and `Enter` opening the detail screen with the 30-day candlestick chart stretching the full column; cycling to `Monochrome` kept everything readable without color. `q`/`Esc` restored the terminal each time.
+
+Quality gate `G7`:
+
+- [ ] All M7 tasks are accepted.
+- [ ] The baseline checks in `docs/TESTING.md` pass with the new charts.
+
 ## Deferred Tracks
 
 These items require a new milestone and acceptance criteria. They are not implicit MVP work:

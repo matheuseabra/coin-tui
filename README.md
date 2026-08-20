@@ -9,7 +9,7 @@ It shows a compact global market summary and up to 100 coins ranked by market ca
 - Global market summary: market cap, 24-hour volume, BTC dominance, 24-hour change
 - 100 coins by market cap with price, changes, cap, volume, supply, and sparkline
 - Keyboard navigation, stable sorting, case-insensitive search, manual refresh
-- A read-only coin detail screen with a gradient 7-day chart and a rich data sidebar
+- A read-only coin detail screen with a 30-day candlestick chart and a rich data sidebar
 - News and sentiment panes, cycled with `Tab`/`Shift-Tab`
 - Responsive layouts (compact, standard, full) and an explicit status for every state
 - USD-only quotes; works with or without color and at low resolution

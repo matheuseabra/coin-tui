@@ -85,7 +85,19 @@ def build_coin_detail(coin_id, index):
     }
 
 
+def build_market_chart(index):
+    """30 days of hourly prices: a bounded rise-then-fall around `index`."""
+    prices = []
+    for hour in range(30 * 24):
+        price = (index * 1000.0) * (1.0 + 0.1 * (hour % 30) / 30.0) + (hour % 7)
+        prices.append([hour * 3600 * 1000, price])
+    return {"prices": prices, "market_caps": [], "total_volumes": []}
+
+
+MARKET_CHART_BODY = json.dumps(build_market_chart(1)).encode()
+
 ROWS_BODY = json.dumps(build_rows()).encode()
+
 GLOBAL_BODY = json.dumps(
     {
         "data": {
@@ -146,11 +158,15 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(delay_ms / 1000.0)
             self._send(RSS_BODY)
         elif path.startswith("/api/v3/coins/"):
-            coin_id = path[len("/api/v3/coins/") :]
+            rest = path[len("/api/v3/coins/") :]
+            coin_id, sep, suffix = rest.partition("/")
             if coin_id.startswith("fixture-coin-") and coin_id[13:].isdigit():
                 index = int(coin_id[13:])
                 if 1 <= index <= 100:
-                    self._send(json.dumps(build_coin_detail(coin_id, index)).encode())
+                    if suffix == "market_chart":
+                        self._send(json.dumps(build_market_chart(index)).encode())
+                    else:
+                        self._send(json.dumps(build_coin_detail(coin_id, index)).encode())
                     return
             self.send_error(404)
         else:

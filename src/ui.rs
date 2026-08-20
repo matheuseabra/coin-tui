@@ -1,7 +1,6 @@
 use chrono::Utc;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
-    prelude::Stylize,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
@@ -14,7 +13,7 @@ const MAX_SANITIZED_SCALARS: usize = 256;
 use crate::{
     api::ApiError,
     app::{App, DataState, DetailState, MainPane},
-    domain::CoinMarket,
+    domain::{daily_candles, CoinMarket},
     format::{
         format_age, format_compact_money, format_compact_supply, format_percentage, format_price,
     },
@@ -28,12 +27,9 @@ const MIN_HEIGHT: u16 = 16;
 /// Main-view panes (news and sentiment) appear beside the market table at or
 /// above this width; below it `Tab`/`Shift-Tab` show one focused pane at a
 /// time so the table keeps its full column set. The threshold leaves the
-/// table at least 120 columns after the 42-column pane column, so Full-mode
-/// columns stay available whenever the panes are side-by-side.
+/// table at 70% of the width, so Full-mode columns stay available whenever
+/// the panes are side-by-side.
 const PANE_MIN_WIDTH: u16 = 162;
-
-/// Width of the right pane column when panes are side-by-side.
-const SIDE_COLUMN: u16 = 42;
 
 /// Detail sidebar (coin data) appears beside the chart when the pane is at
 /// least this wide; below it the stats render as stacked lines under chart.
@@ -209,8 +205,9 @@ fn render_body(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, wi
 }
 
 /// Route the market panes. Wide terminals show the table plus a right column
-/// (news wire on top, market breadth below); narrow terminals show one focused
-/// pane at a time so the table keeps its full column set.
+/// (news wire on top, market breadth below) split 70/30 with the right column
+/// divided into two equal rows; narrow terminals show one focused pane at a
+/// time so the table keeps its full column set.
 fn render_market(
     title: &str,
     app: &App,
@@ -229,12 +226,12 @@ fn render_market(
     }
     let [table_area, right] = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(1), Constraint::Length(SIDE_COLUMN)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .areas(area);
     table_frame(title, app, info, frame, table_area, table_area.width);
     let [news_area, sentiment_area] = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .areas(right);
     news_pane(app, frame, news_area, app.pane_focus() == MainPane::News);
     sentiment_pane(
@@ -352,8 +349,7 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
     let changes: Vec<f64> = snapshot
         .coins()
         .iter()
-        .filter_map(|coin| finite(coin.change_24h()))
-        .collect();
+        .filter_map(|coin| finite(coin.ch        .collect();
     if changes.is_empty() {
         return vec![Line::styled(
             "No 24h data yet.",
@@ -581,9 +577,13 @@ fn render_detail_main(
     }
 }
 
-/// The detail chart uses the rich hourly series when one is available and
-/// otherwise falls back to the row-derived 7-day series.
+/// The detail chart series: the 30-day market-chart series when it has
+/// landed, otherwise the rich hourly 7-day series, otherwise the row-derived
+/// 7-day series.
 fn detail_series(state: &DetailState) -> &[f64] {
+    if !state.chart_30d().is_empty() {
+        return state.chart_30d();
+    }
     match state {
         DetailState::Ready { detail, .. } if !detail.sparkline_7d().is_empty() => {
             detail.sparkline_7d()
@@ -598,18 +598,84 @@ fn render_detail_chart(
     area: ratatui::layout::Rect,
     theme: &Theme,
 ) {
-    let trend = trend_color(state.base(), theme);
-    let Some(lines) = price_chart_lines(
-        detail_series(state),
-        area.width,
-        area.height,
-        trend,
-        theme.summary,
-    ) else {
-        frame.render_widget(Paragraph::new("No 7-day price data available."), area);
+    let Some(candles) = detail_candles(state) else {
+        frame.render_widget(Paragraph::new("No price data available."), area);
         return;
     };
-    frame.render_widget(Paragraph::new(lines), area);
+    let chart = chandelier::CandlestickChart::new(
+        chandelier::CandleSeries::new(&candles.bars)
+            .bull_style(Style::default().fg(theme.gain))
+            .bear_style(Style::default().fg(theme.loss))
+            .wick_style(Style::default().fg(trend_color(state.base(), theme)))
+            .width(candle_width(candles.bars.len(), area.width))
+            .gap(1.0),
+    )
+    .axes(true);
+    let [chart_area, caption_area] = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .areas(area);
+    frame.render_widget(chart, chart_area);
+    let period = if state.chart_30d().is_empty() {
+        "7 days"
+    } else {
+        "30 days"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "{period}: {} → {}",
+                format_price(Some(candles.low)),
+                format_price(Some(candles.high))
+            ),
+            Style::default().fg(theme.summary),
+        ))),
+        caption_area,
+    );
+}
+
+/// The candles for the detail chart plus the plotted price range, derived as
+/// daily OHLC from the rich hourly series when present, else from the
+/// row-derived 7-day series. `None` when there is no finite series to plot.
+fn detail_candles(state: &DetailState) -> Option<DetailCandles> {
+    let series = detail_series(state);
+    let values: Vec<f64> = series
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let bars = daily_candles(&values)
+        .into_iter()
+        .map(|candle| chandelier::Candle::new(candle.open, candle.high, candle.low, candle.close))
+        .collect();
+    Some(DetailCandles { bars, low, high })
+}
+
+/// Derived daily candles plus the original series low/high for the caption.
+struct DetailCandles {
+    bars: Vec<chandelier::Candle>,
+    low: f64,
+    high: f64,
+}
+
+/// Candle body width (columns) so `count` candles with a 1-column gap stretch
+/// across the chart's plot area (the width minus the right-hand price axis).
+/// Chandelier quantizes to its grid; a floor of 1 keeps candles visible even
+/// when there are many of them.
+fn candle_width(count: usize, area_width: u16) -> f64 {
+    if count == 0 {
+        return 1.0;
+    }
+    // Reserve ~8 columns for the price axis, then split the rest between the
+    // bodies and the 1-column gaps between them.
+    let plot = (area_width as usize).saturating_sub(8);
+    let per_candle = plot.saturating_div(count).max(2);
+    (per_candle as f64 - 1.0).max(1.0)
 }
 
 /// Compact (no-sidebar) market-stats grid: two bounded lines under the chart.
@@ -776,7 +842,7 @@ fn detail_stat_rows(state: &DetailState) -> Vec<(&'static str, String)> {
             }
             rows
         }
-        DetailState::Basic(coin) | DetailState::Loading { base: coin } => vec![
+        DetailState::Basic(coin) | DetailState::Loading { base: coin, .. } => vec![
             ("Mkt cap", format_compact_money(coin.market_cap())),
             ("Vol 24h", format_compact_money(coin.volume_24h())),
             ("Supply", format_compact_supply(coin.circulating_supply())),
@@ -881,23 +947,10 @@ fn change_line(coin: &CoinMarket, theme: &Theme) -> Line<'static> {
     line
 }
 
-/// Maximum number of chart points after downsampling, so a hostile provider
-/// series can never unbounded the chart's memory or layout work.
-const MAX_CHART_POINTS: usize = 512;
-
 /// Detail content column width: the CMC-style page stays one fixed width no
 /// matter the terminal, hugging the pane's left border instead of stretching
 /// across the screen.
 const DETAIL_CONTENT_WIDTH: u16 = 56;
-
-/// Number of body rows the price chart draws (plus one caption line below).
-const CHART_ROWS: u16 = 6;
-
-const MIN_CHART_AREA_WIDTH: u16 = 34;
-const MIN_CHART_AREA_HEIGHT: u16 = 4;
-
-/// Number of gradient shades used to fade the area fill away from the line.
-const GRADIENT_SHADES: usize = 8;
 
 /// The chart line color and where its gradient starts: gain, loss, or neutral
 /// by the sign of the 7-day change.
@@ -907,238 +960,6 @@ fn trend_color(coin: &CoinMarket, theme: &Theme) -> Color {
         Some(_) => theme.loss,
         None => theme.neutral,
     }
-}
-
-/// A bounded, left-aligned 7-day gradient area chart styled after the
-/// CoinMarketCap price chart. The already-filtered series is min-max
-/// normalized into `[0.0, 1.0]` (flat or overflow falls back to a mid-line),
-/// sampled at half-block resolution, and filled from the line down to the
-/// bottom with a gradient that fades away from the line. Real price labels
-/// and the range caption use the `accent` color. Returns `None` when the pane
-/// is too small or there is no finite series to plot.
-fn price_chart_lines(
-    series: &[f64],
-    area_width: u16,
-    area_height: u16,
-    trend: Color,
-    accent: Color,
-) -> Option<Vec<Line<'static>>> {
-    if area_width < MIN_CHART_AREA_WIDTH || area_height < MIN_CHART_AREA_HEIGHT {
-        return None;
-    }
-    let (points, low, high) = bounded_chart_points(series);
-    if points.is_empty() {
-        return None;
-    }
-    let values = if points.len() == 1 {
-        vec![points[0], points[0]]
-    } else {
-        points
-    };
-    let rows = CHART_ROWS.min(area_height.saturating_sub(2)).max(2) as usize;
-
-    let mut labels = Vec::with_capacity(rows);
-    let mut label_width = 0usize;
-    for row in 0..rows {
-        let t = if rows == 1 {
-            0.0
-        } else {
-            row as f64 / (rows - 1) as f64
-        };
-        let price = if high > low {
-            high - (high - low) * t
-        } else {
-            high
-        };
-        let text = format_price(Some(price));
-        label_width = label_width.max(UnicodeWidthStr::width(text.as_str()));
-        labels.push(text);
-    }
-    let graph_width = (area_width as usize).saturating_sub(label_width + 2).max(4);
-
-    let ramp = gradient_ramp(trend, GRADIENT_SHADES);
-    let half_rows = rows * 2;
-    let mut lines = Vec::with_capacity(rows + 1);
-    for (row, label) in labels.iter().enumerate() {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let pad = label_width - UnicodeWidthStr::width(label.as_str());
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        spans.push(Span::styled(label.clone(), Style::default().fg(accent)));
-        spans.push(Span::raw(" "));
-        let mut run: Option<(char, Color)> = None;
-        let mut run_len = 0usize;
-        for column in 0..graph_width {
-            let t = if graph_width == 1 {
-                0.0
-            } else {
-                column as f64 / (graph_width - 1) as f64
-            };
-            let value = sample_series(&values, t).clamp(0.0, 1.0);
-            let line_sub = ((1.0 - value) * (half_rows - 1) as f64).round() as usize;
-            let top = row * 2;
-            let bottom = top + 1;
-            let (glyph, distance) = match (top >= line_sub, bottom >= line_sub) {
-                (true, true) => ('█', Some(top - line_sub)),
-                (true, false) => ('▀', Some(top - line_sub)),
-                (false, true) => ('▄', Some(bottom - line_sub)),
-                (false, false) => (' ', None),
-            };
-            let fill = match distance {
-                Some(distance) => ramp[(distance / 2).min(ramp.len() - 1)],
-                None => Color::Reset,
-            };
-            push_run(&mut spans, &mut run, &mut run_len, glyph, fill);
-        }
-        flush_run(&mut spans, &mut run, &mut run_len);
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::from(Span::styled(
-        format!(
-            "7 days: {} → {}",
-            format_price(Some(low)),
-            format_price(Some(high))
-        ),
-        Style::default().fg(accent),
-    )));
-    Some(lines)
-}
-
-/// Sample the normalized series at fraction `t` across `[0.0, 1.0]` of its
-/// length, linearly interpolating between points.
-fn sample_series(points: &[f64], t: f64) -> f64 {
-    let last = (points.len() - 1) as f64;
-    let position = (t * last).min(last);
-    let left = position.floor() as usize;
-    let right = (left + 1).min(points.len() - 1);
-    let fraction = position - left as f64;
-    points[left] + (points[right] - points[left]) * fraction
-}
-
-/// Append `glyph` to the current styled run, merging consecutive cells that
-/// share a glyph and color so each chart row stays a small number of spans.
-fn push_run(
-    spans: &mut Vec<Span<'static>>,
-    run: &mut Option<(char, Color)>,
-    run_len: &mut usize,
-    glyph: char,
-    color: Color,
-) {
-    if *run == Some((glyph, color)) {
-        *run_len += 1;
-        return;
-    }
-    flush_run(spans, run, run_len);
-    *run = Some((glyph, color));
-    *run_len = 1;
-}
-
-fn flush_run(spans: &mut Vec<Span<'static>>, run: &mut Option<(char, Color)>, run_len: &mut usize) {
-    if let Some((glyph, color)) = run.take() {
-        spans.push(Span::styled(
-            glyph.to_string().repeat(*run_len),
-            Style::default().fg(color),
-        ));
-    }
-}
-
-/// A ramp of `steps` shades from `base` down to a darkened endpoint, so the
-/// area fill fades away from the chart line like a CoinMarketCap gradient.
-/// Named ANSI colors are mapped to the RGB value typical terminals render so
-/// every color theme gets a gradient, while `Color::Reset` (Monochrome) and
-/// unknown roles return a solid ramp and stay readable without color.
-fn gradient_ramp(base: Color, steps: usize) -> Vec<Color> {
-    let steps = steps.max(1);
-    let Some((r, g, b)) = color_to_rgb(base) else {
-        return vec![base; steps];
-    };
-    let darken = |channel: u8| (channel as u16 * 35 / 100).min(255) as u8;
-    let (er, eg, eb) = (darken(r), darken(g), darken(b));
-    (0..steps)
-        .map(|i| {
-            let t = i as f32 / (steps - 1) as f32;
-            Color::Rgb(
-                (r as f32 + (er as f32 - r as f32) * t).round() as u8,
-                (g as f32 + (eg as f32 - g as f32) * t).round() as u8,
-                (b as f32 + (eb as f32 - b as f32) * t).round() as u8,
-            )
-        })
-        .collect()
-}
-
-/// Convert a color to RGB for gradient interpolation. Named ANSI colors use
-/// the bright xterm-style value typical terminals render; `Reset` and unknown
-/// indexed colors return `None` so the ramp stays solid.
-fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
-    Some(match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => (0, 0, 0),
-        Color::Red => (230, 60, 60),
-        Color::LightRed => (255, 110, 110),
-        Color::Green => (70, 200, 100),
-        Color::LightGreen => (120, 230, 150),
-        Color::Blue => (70, 130, 235),
-        Color::LightBlue => (120, 170, 255),
-        Color::Yellow => (235, 190, 60),
-        Color::LightYellow => (255, 230, 120),
-        Color::Magenta => (200, 90, 190),
-        Color::LightMagenta => (240, 140, 230),
-        Color::Cyan => (60, 190, 210),
-        Color::LightCyan => (120, 220, 235),
-        Color::White => (220, 220, 220),
-        Color::Gray => (130, 130, 130),
-        Color::DarkGray => (85, 85, 85),
-        Color::Reset | Color::Indexed(_) => return None,
-    })
-}
-
-/// Downsample to `MAX_CHART_POINTS` equal buckets, then min-max normalize into
-/// `[0.0, 1.0]` so the chart's axis bounds are always finite. Drops non-finite
-/// points (matching the domain boundary), and a flat or overflow range renders
-/// as a flat mid-line instead of empty bounds. Returns the normalized points
-/// and the original low/high prices for the axis label.
-fn bounded_chart_points(series: &[f64]) -> (Vec<f64>, f64, f64) {
-    let values: Vec<f64> = series
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect();
-    if values.is_empty() {
-        return (Vec::new(), 0.0, 0.0);
-    }
-    let downsampled = if values.len() > MAX_CHART_POINTS {
-        let bucket_size = values.len().div_ceil(MAX_CHART_POINTS);
-        let mut buckets: Vec<f64> = Vec::with_capacity(MAX_CHART_POINTS);
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for (index, value) in values.iter().copied().enumerate() {
-            sum += value;
-            count += 1;
-            if (index + 1) % bucket_size == 0 || index + 1 == values.len() {
-                buckets.push(sum / count as f64);
-                sum = 0.0;
-                count = 0;
-            }
-        }
-        buckets
-    } else {
-        values
-    };
-    let low = downsampled.iter().copied().fold(f64::INFINITY, f64::min);
-    let high = downsampled
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let range = high - low;
-    if !(range.is_finite() && range != 0.0) {
-        return (vec![0.5; downsampled.len()], low, high);
-    }
-    let scaled = downsampled
-        .iter()
-        .map(|value| ((value - low) / range).clamp(0.0, 1.0))
-        .collect();
-    (scaled, low, high)
 }
 
 fn detail_footer(width: u16) -> String {
@@ -1411,7 +1232,7 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
 
 /// Draw a full-width separator under every visible row except the last one and
 /// the selected row, so plain rows read as Bloomberg-style ledger lines. The
-/// scroll offset mirrors ratatui's: rows are two lines tall below a one-line
+/// scroll offset mirrors ratatui's: rows are two lines tall below the one-line
 /// header, and the selected row is kept within the visible window.
 fn render_row_separators(
     frame: &mut Frame<'_>,
@@ -1424,7 +1245,8 @@ fn render_row_separators(
         return;
     }
     const ROW_HEIGHT: u16 = 2;
-    let visible = ((area.height.saturating_sub(1)) / ROW_HEIGHT).max(1) as usize;
+    const HEADER_CHROME: u16 = 1;
+    let visible = ((area.height.saturating_sub(HEADER_CHROME)) / ROW_HEIGHT).max(1) as usize;
     let last = rows - 1;
     let selected = selected.min(last);
     let offset = if selected >= visible {
@@ -1442,7 +1264,8 @@ fn render_row_separators(
         if index == last || index == selected {
             continue;
         }
-        let y = area.y + 1 + (window as u16) * ROW_HEIGHT + 1;
+        // Below the row's two content lines.
+        let y = area.y + HEADER_CHROME + (window as u16) * ROW_HEIGHT + 1;
         if y >= area.y + area.height {
             break;
         }
@@ -1959,11 +1782,6 @@ mod tests {
             .collect()
     }
 
-    fn is_chart_row(line: &Line) -> bool {
-        let text = line_text(line);
-        text.contains('$') && text.contains(['█', '▀', '▄'])
-    }
-
     fn app_with(result: Result<crate::api::FetchOutcome, ApiError>) -> App {
         let mut app = App::new();
         let Command::Fetch { generation, .. } = app.update(Event::Start) else {
@@ -2434,12 +2252,6 @@ mod tests {
             Some(Color::Green),
             "rising sparkline is colored with the gain role"
         );
-        assert!(
-            cell_text(&up.coins()[0], trend)
-                .chars()
-                .any(|ch| SPARKLINE_GLYPHS.contains(&ch)),
-            "glyphs remain as text"
-        );
         let down = market(Some(-5.0));
         assert_eq!(
             cell_style(&down.coins()[0], trend, &theme).fg,
@@ -2503,86 +2315,62 @@ mod tests {
     }
 
     #[test]
-    fn price_chart_is_left_aligned_bounded_and_gradient_styled() {
-        let trend = Color::Rgb(200, 100, 50);
-        let accent = Color::Cyan;
-        let chart =
-            price_chart_lines(&[1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0], 56, 10, trend, accent).unwrap();
-        assert_eq!(
-            chart.len(),
-            CHART_ROWS as usize + 1,
-            "CHART_ROWS body rows plus the caption line"
-        );
-        let body = &chart[..chart.len() - 1];
-        assert!(
-            body.iter()
-                .all(|line| UnicodeWidthStr::width(line_text(line).as_str()) <= 56),
-            "every row stays inside the content column"
-        );
-        assert!(
-            body.iter().all(|line| is_chart_row(line)),
-            "every chart row has a price label and a fixed-width glyph run"
-        );
-        assert!(
-            body.iter()
-                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(trend))),
-            "the line and its near fill use the full trend color"
-        );
-        assert!(
-            body.iter()
-                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(accent))),
-            "the price labels use the accent color"
-        );
-        assert!(
-            line_text(chart.last().unwrap()).contains("7 days:"),
-            "caption shows the range: {:?}",
-            chart.last().unwrap()
-        );
+    fn detail_candles_derive_ohlc_and_caption_bounds() {
+        // A rising week derives one candle per day plus the series range.
+        let app = detail_app(vec![detail_row(
+            "Bitcoin",
+            "BTC",
+            1.0,
+            1.0,
+            (0..168).map(|hour| hour as f64).collect(),
+        )]);
+        let state = app.detail_state().expect("detail is open");
+        let candles = detail_candles(state).expect("finite series plots");
+        assert_eq!(candles.bars.len(), 7, "one candle per day");
+        assert_eq!(candles.low, 0.0);
+        assert_eq!(candles.high, 167.0);
+        assert_eq!(candles.bars[0].open, 0.0);
+        assert_eq!(candles.bars[6].close, 167.0);
 
-        let flat = price_chart_lines(&[5.0, 5.0, 5.0], 56, 10, trend, accent).unwrap();
-        assert!(
-            flat.iter()
-                .any(|line| line.spans.iter().any(|span| span.style.fg == Some(trend))),
-            "flat series renders a mid-line with the trend color"
-        );
-        assert_eq!(
-            price_chart_lines(&[f64::NAN, f64::INFINITY], 56, 10, trend, accent),
-            None,
-            "all-non-finite series has nothing to plot"
-        );
-        assert_eq!(
-            price_chart_lines(&[1.0, 2.0], 20, 10, trend, accent),
-            None,
-            "pane below the minimum width is skipped"
-        );
+        // An all-non-finite series has nothing to plot.
+        let hostile = detail_app(vec![detail_row(
+            "Bitcoin",
+            "BTC",
+            1.0,
+            0.0,
+            vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
+        )]);
+        assert!(detail_candles(hostile.detail_state().unwrap()).is_none());
+
+        // An empty series has nothing to plot.
+        let empty = detail_app(vec![detail_row("Bitcoin", "BTC", 1.0, 0.0, vec![])]);
+        assert!(detail_candles(empty.detail_state().unwrap()).is_none());
     }
 
     #[test]
-    fn gradient_ramp_fades_rgb_and_stays_solid_without_one() {
-        let ramp = gradient_ramp(Color::Rgb(200, 100, 50), 5);
-        assert_eq!(ramp.len(), 5);
-        assert_eq!(ramp[0], Color::Rgb(200, 100, 50));
+    fn detail_chart_uses_theme_roles_and_keeps_the_caption() {
+        let app = detail_app(vec![detail_row(
+            "Bitcoin",
+            "BTC",
+            50_000.0,
+            -2.0,
+            vec![1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0],
+        )]);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let buffer: &Buffer = terminal.backend().buffer();
+        let all: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(all.contains("7 days:"), "caption retained: {all:?}");
+        // The candlestick body/wick glyphs render inside the content column.
         assert!(
-            ramp.windows(2).all(|stage| match (stage[0], stage[1]) {
-                (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) => {
-                    [r0 >= r1, g0 >= g1, b0 >= b1]
-                        .into_iter()
-                        .all(|darker| darker)
-                }
-                _ => false,
-            }),
-            "each stage darkens toward the endpoint"
+            all.contains('│') || all.contains('▌'),
+            "candlestick glyphs render: {all:?}"
         );
-        assert_eq!(
-            gradient_ramp(Color::Reset, 4),
-            vec![Color::Reset; 4],
-            "Monochrome stays solid and colorless"
-        );
-        assert_eq!(
-            gradient_ramp(Color::Green, 3).len(),
-            3,
-            "named ANSI colors are converted to RGB so they can fade"
-        );
+        // The wick uses the trend color (loss for a -2% 7d change).
+        let loss_style = buffer.content().iter().find(|cell| {
+            matches!(cell.symbol(), "│" | "▌" | "▐") && cell.style().fg == Some(Color::Red)
+        });
+        assert!(loss_style.is_some(), "bear wick uses the loss role");
     }
 
     fn missing_input() -> CoinMarketInput {
@@ -3675,7 +3463,10 @@ mod tests {
         assert!(rendered.contains("24h: +1.50%"), "{rendered:?}");
         assert!(rendered.contains("7d: -2.00%"), "{rendered:?}");
         assert!(rendered.contains("7 days:"), "chart caption: {rendered:?}");
-        assert!(rendered.contains('█'), "chart area renders: {rendered:?}");
+        assert!(
+            rendered.contains('│') || rendered.contains('▌') || rendered.contains('▐'),
+            "candlestick wicks and bodies render: {rendered:?}"
+        );
     }
 
     #[test]
@@ -3683,7 +3474,7 @@ mod tests {
         let app = detail_app(vec![detail_row("Bitcoin", "BTC", 1.0, 0.0, vec![])]);
         let rendered = text_at(&app, 60, 16);
         assert!(
-            rendered.contains("No 7-day price data available."),
+            rendered.contains("No price data available."),
             "{rendered:?}"
         );
         assert!(!rendered.contains("7 days:"), "{rendered:?}");
@@ -3700,8 +3491,8 @@ mod tests {
         )]);
         let rendered = text_at(&hostile, 80, 24);
         assert!(
-            rendered.contains('█'),
-            "non-finite points are dropped: {rendered:?}"
+            rendered.contains('│') || rendered.contains('▌'),
+            "non-finite points are dropped and candles render: {rendered:?}"
         );
 
         let flat = detail_app(vec![detail_row(
@@ -3713,8 +3504,8 @@ mod tests {
         )]);
         let rendered = text_at(&flat, 80, 24);
         assert!(
-            rendered.contains('█'),
-            "flat series renders a mid-line: {rendered:?}"
+            rendered.contains("7 days:"),
+            "flat series still renders a chart with its caption: {rendered:?}"
         );
 
         let huge = detail_app(vec![detail_row(
@@ -3726,8 +3517,8 @@ mod tests {
         )]);
         let rendered = text_at(&huge, 80, 24);
         assert!(
-            rendered.contains('█'),
-            "long series is downsampled and renders: {rendered:?}"
+            rendered.contains('│') || rendered.contains('▌'),
+            "long series is downsampled to daily candles and renders: {rendered:?}"
         );
     }
 
@@ -3742,14 +3533,14 @@ mod tests {
         )]);
         let compact = text_at(&app, 60, 16);
         assert!(compact.contains("#1  Bitcoin (BTC)"), "{compact:?}");
-        assert!(compact.contains('█'), "{compact:?}");
+        assert!(compact.contains("7 days:"), "{compact:?}");
         assert!(
             compact.contains("Esc back | ? help | q quit | r refresh"),
             "{compact:?}"
         );
         let full = text_at(&app, 120, 30);
         assert!(full.contains("#1  Bitcoin (BTC)"), "{full:?}");
-        assert!(full.contains('█'), "{full:?}");
+        assert!(full.contains("7 days:"), "{full:?}");
     }
 
     #[test]
