@@ -13,12 +13,13 @@ const MAX_SANITIZED_SCALARS: usize = 256;
 use crate::{
     api::ApiError,
     app::{App, DataState, DetailState, MainPane},
-    domain::{daily_candles, CoinMarket, PricePoint},
+    domain::{daily_candles, CoinMarket},
     format::{
         format_age, format_compact_money, format_compact_supply, format_percentage, format_price,
     },
     news::NewsItem,
     theme::{Theme, THEMES},
+    view,
 };
 
 const MIN_WIDTH: u16 = 60;
@@ -247,42 +248,39 @@ fn render_market(
 fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
     let theme = app.theme();
     let inner_width = area.width.saturating_sub(2) as usize;
-    let lines: Vec<Line<'static>> = match app.news_feed() {
-        Some(feed) => {
-            let mut lines: Vec<Line<'static>> = Vec::new();
-            for item in &feed.items {
-                lines.push(headline_line(item, inner_width, theme));
-                let url = item.url();
-                if !url.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        clean_remote(url, inner_width),
-                        Style::default(),
-                    )));
-                }
-            }
-            if feed.items.is_empty() && feed.notice.is_none() {
-                lines.push(Line::styled(
-                    "No headlines yet.",
-                    Style::default().fg(theme.notice),
-                ));
-            }
-            if let Some(error) = &feed.notice {
-                lines.push(Line::styled(
-                    format!("News refresh failed: {}.", short_error(error)),
-                    Style::default().fg(theme.notice),
-                ));
-            }
-            lines
+    let projection = view::news(app.news_feed(), app.news_enabled());
+    let mut lines = Vec::new();
+    for item in &projection.items {
+        lines.push(headline_line(item, inner_width, theme));
+        if !item.url().is_empty() {
+            lines.push(Line::from(Span::styled(
+                clean_remote(item.url(), inner_width),
+                Style::default(),
+            )));
         }
-        None => vec![Line::styled(
-            if app.news_enabled() {
-                "Loading headlines..."
+    }
+    if projection.items.is_empty() {
+        lines.push(Line::styled(
+            if let Some(error) = &projection.notice {
+                format!("News refresh failed: {}.", short_error(error))
+            } else if projection.loading {
+                "Loading headlines...".to_owned()
+            } else if projection.enabled {
+                "No headlines yet.".to_owned()
             } else {
-                "News feed unavailable."
+                "News feed unavailable.".to_owned()
             },
             Style::default().fg(theme.notice),
-        )],
-    };
+        ));
+    }
+    if let Some(error) = &projection.notice {
+        if !projection.items.is_empty() {
+            lines.push(Line::styled(
+                format!("News refresh failed: {}.", short_error(error)),
+                Style::default().fg(theme.notice),
+            ));
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines).block(pane_block("News", focused, theme)),
         area,
@@ -346,22 +344,12 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
             Style::default().fg(theme.notice),
         )];
     };
-    let changes: Vec<f64> = snapshot
-        .coins()
-        .iter()
-        .filter_map(|coin| finite(coin.change_24h()))
-        .collect();
-    if changes.is_empty() {
+    let Some(projection) = view::sentiment(snapshot) else {
         return vec![Line::styled(
             "No 24h data yet.",
             Style::default().fg(theme.notice),
         )];
-    }
-    let up = changes.iter().filter(|&&value| value > 0.0).count();
-    let down = changes.iter().filter(|&&value| value < 0.0).count();
-    let flat = changes.len() - up - down;
-    let bullish = ((up as f64 * 100.0) / changes.len() as f64).round() as usize;
-    let average = changes.iter().sum::<f64>() / changes.len() as f64;
+    };
     let mut lines = Vec::with_capacity(6);
     lines.push(Line::styled(
         "24h breadth",
@@ -369,13 +357,16 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
             .fg(theme.summary)
             .add_modifier(Modifier::BOLD),
     ));
-    lines.push(Line::from(format!("Up {up}   Down {down}   Flat {flat}")));
+    lines.push(Line::from(format!(
+        "Up {}   Down {}   Flat {}",
+        projection.up, projection.down, projection.flat
+    )));
     let meter_prefix = "Bullish ";
-    let meter_suffix = format!(" {bullish}%");
+    let meter_suffix = format!(" {}%", projection.bullish);
     let bar_cells = width
         .saturating_sub(meter_prefix.len() + meter_suffix.len())
         .max(1);
-    let filled = (bar_cells * bullish / 100).min(bar_cells);
+    let filled = (bar_cells * projection.bullish / 100).min(bar_cells);
     let meter = format!(
         "{}{}{}",
         meter_prefix,
@@ -385,38 +376,23 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
     lines.push(Line::styled(meter, Style::default().fg(theme.gain)));
     lines.push(Line::from(format!(
         "Avg 24h: {}",
-        format_percentage(Some(average))
+        format_percentage(Some(projection.average))
     )));
-    if let Some((coin, value)) = extreme_coin(snapshot.coins(), true) {
+    if let Some((symbol, value)) = projection.best {
         lines.push(Line::from(format!(
             "Best: {} {}",
-            clean_remote(coin.symbol(), 8),
+            clean_remote(&symbol, 8),
             format_percentage(Some(value)),
         )));
     }
-    if let Some((coin, value)) = extreme_coin(snapshot.coins(), false) {
+    if let Some((symbol, value)) = projection.worst {
         lines.push(Line::from(format!(
             "Worst: {} {}",
-            clean_remote(coin.symbol(), 8),
+            clean_remote(&symbol, 8),
             format_percentage(Some(value)),
         )));
     }
     lines
-}
-
-/// The coin with the highest or lowest finite 24-hour change (ties keep the
-/// first encountered); `None` when no coin carries valid data.
-fn extreme_coin(coins: &[CoinMarket], highest: bool) -> Option<(&CoinMarket, f64)> {
-    coins
-        .iter()
-        .filter_map(|coin| finite(coin.change_24h()).map(|change| (coin, change)))
-        .reduce(|acc, next| {
-            if (highest && next.1 > acc.1) || (!highest && next.1 < acc.1) {
-                next
-            } else {
-                acc
-            }
-        })
 }
 
 fn message(
@@ -578,36 +554,6 @@ fn render_detail_main(
     }
 }
 
-/// The detail chart series: the 30-day market-chart series when it has
-/// landed, otherwise the rich hourly 7-day series, otherwise the row-derived
-/// 7-day series.
-fn detail_series(state: &DetailState) -> Vec<PricePoint> {
-    if !state.chart_30d().is_empty() {
-        return state.chart_30d().to_vec();
-    }
-    match state {
-        DetailState::Ready { detail, .. } if !detail.sparkline_7d().is_empty() => detail
-            .sparkline_7d()
-            .iter()
-            .enumerate()
-            .map(|(index, &price)| PricePoint {
-                timestamp: index as f64 * 3_600_000.0,
-                price,
-            })
-            .collect(),
-        _ => state
-            .base()
-            .sparkline_7d()
-            .iter()
-            .enumerate()
-            .map(|(index, &price)| PricePoint {
-                timestamp: index as f64 * 3_600_000.0,
-                price,
-            })
-            .collect(),
-    }
-}
-
 fn render_detail_chart(
     frame: &mut Frame<'_>,
     state: &DetailState,
@@ -654,22 +600,16 @@ fn render_detail_chart(
 /// daily OHLC from the rich hourly series when present, else from the
 /// row-derived 7-day series. `None` when there is no finite series to plot.
 fn detail_candles(state: &DetailState) -> Option<DetailCandles> {
-    let series = detail_series(state);
-    let values: Vec<f64> = series
-        .iter()
-        .map(|point| point.price)
-        .filter(|value| value.is_finite())
-        .collect();
-    if values.is_empty() {
-        return None;
-    }
-    let low = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let bars = daily_candles(&series)
+    let projection = view::detail(state)?;
+    let bars = daily_candles(&projection.series)
         .into_iter()
         .map(|candle| chandelier::Candle::new(candle.open, candle.high, candle.low, candle.close))
         .collect();
-    Some(DetailCandles { bars, low, high })
+    Some(DetailCandles {
+        bars,
+        low: projection.low,
+        high: projection.high,
+    })
 }
 
 /// Derived daily candles plus the original series low/high for the caption.

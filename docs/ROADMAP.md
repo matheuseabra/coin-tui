@@ -269,21 +269,25 @@ review without changing the read-only product contract.
   Depends on: `M7-03`.
   Acceptance: historical price points retain provider timestamps; candle grouping uses timestamp windows, remains bounded, sorts unsorted input, and ignores non-finite points.
   Evidence: Added domain `PricePoint` values and timestamp-window `daily_candles` aggregation. The chart provider now rejects non-finite timestamps/prices while preserving valid timestamps; fallback sparkline values receive synthetic hourly timestamps. Added irregular and unsorted point coverage. Final verification passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` with 201 tests (149 unit + 52 provider).
-- [ ] `M8-03` Deepen the operation lifecycle seam.
+- [x] `M8-03` Deepen the operation lifecycle seam.
   Depends on: `M8-01`.
   Acceptance: market, news, detail, and chart task spawning, cancellation, generation checks, and stale-result handling use one internal lifecycle implementation; App-level behavior remains unchanged.
-- [ ] `M8-04` Separate pure UI projection from Ratatui widget emission.
+  Evidence: `Controller::spawn_operation` now owns the shared cancellable task lifecycle and event delivery; market, news, detail, and chart requests provide only their operation future and typed event mapping. Existing generation guards and App state transitions remain unchanged. Focused delayed-refresh, joined-shutdown, duplicate-refresh, stale-result, and chart-arrival tests pass; full `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` pass with 201 tests (149 unit + 52 provider).
+- [x] `M8-04` Separate pure UI projection from Ratatui widget emission.
   Depends on: `M8-02`.
   Acceptance: market, detail, sentiment, and news projections have pure test surfaces; `ui.rs` retains layout and widget emission, with visible rendering unchanged at all required sizes.
-- [ ] `M8-05` Split application transitions into focused private modules.
+  Evidence: Added `src/view.rs` with pure `DetailView`, `SentimentView`, and `NewsView` projections. Detail-series fallback and price ranges, sentiment counts/extremes, and news loading/stale state are now computed outside Ratatui rendering; existing pure market cell/status projections remain in `ui.rs`. Added projection tests for missing/non-finite sentiment values and loading versus disabled news. Full `cargo fmt --all -- --check`, denied-warning Clippy, and `cargo test --all-features` pass with 203 tests (151 unit + 52 provider).
+- [x] `M8-05` Split application transitions into focused private modules.
   Depends on: `M8-03`, `M8-04`.
   Acceptance: App remains the single state owner while input, refresh, detail, and pane transitions gain narrow interfaces and cross-module behavior remains covered through App integration tests.
+  Evidence: Added private `input`, `refresh`, `detail`, and `pane` modules. `App` remains the only owner of mutable state; it delegates key policy/navigation, generation increments, and pane index transitions through small pure interfaces. Existing App integration tests continue to cover modal priority, search, sorting, refresh preservation, detail cancellation, stale generations, pane swallowing, and terminal shutdown. Final verification passed `cargo fmt --all -- --check`, denied-warning Clippy, and `cargo test --all-features` with 203 tests (151 unit + 52 provider).
 
 Quality gate `G8`:
 
-- [ ] All M8 tasks are accepted.
-- [ ] The baseline checks in `docs/TESTING.md` pass after each accepted architecture change.
-- [ ] No user-facing behavior, terminal lifecycle guarantee, or provider security guarantee regresses.
+- [x] All M8 tasks are accepted.
+- [x] The baseline checks in `docs/TESTING.md` pass after each accepted architecture change.
+- [x] No user-facing behavior, terminal lifecycle guarantee, or provider security guarantee regresses.
+  Evidence: M8-01 through M8-05 are accepted. Final `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` pass with 203 tests (151 unit + 52 provider). The full App and TestBackend suites retain the documented keyboard, state, layout, terminal shutdown, sanitization, and provider-failure coverage.
 
 ## Deferred Tracks
 

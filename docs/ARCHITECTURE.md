@@ -86,6 +86,10 @@ src/
 |-- api.rs           # MarketData trait, CoinGecko client and DTO conversion
 |-- domain.rs        # provider-independent market, detail, and price-series types
 |-- http.rs          # shared bounded HTTP transport and URL policy
+|-- input.rs         # keyboard policy and pure navigation transitions
+|-- refresh.rs       # refresh generation transitions
+|-- detail.rs        # detail generation transitions
+|-- pane.rs          # pane-focus transitions
 |-- news.rs          # NewsProvider trait, RSS client and bounded parsing
 |-- format.rs        # deterministic money, percentage and supply formatting
 |-- log.rs           # redacted file tracing
