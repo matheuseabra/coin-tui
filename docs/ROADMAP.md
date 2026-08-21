@@ -262,7 +262,7 @@ Goal: improve locality and leverage at the seams identified in the architecture
 review without changing the read-only product contract.
 
 - [x] `M8-01` Centralize bounded HTTP transport for market and news adapters.
-  Depends on: `G7`.
+  Depends on: `M4-02`, `M6-03`.
   Acceptance: URL policy, no-redirect client construction, timeout handling, status classification, `Retry-After`, content-type checks, and response-size limits have one implementation used by both providers; provider tests keep endpoint and conversion coverage.
   Evidence: Added `src/http.rs` with the shared `HttpClient` implementation. `CoinGeckoClient` and `RssNewsClient` now use the same transport seam; no provider imports another provider's private HTTP helpers. Existing market/news tests cover JSON and RSS responses, malformed content, oversized bodies, transport errors, timeouts, redirects, API-key headers, and rate limits.
 - [x] `M8-02` Preserve timestamps when deriving historical candles.
