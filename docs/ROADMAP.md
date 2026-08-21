@@ -241,7 +241,7 @@ room between the table header and rows.
 - [x] `M7-04` Keep the table row highlight a clean, gap-free block.
   Depends on: `M7-01`.
   Acceptance: the selected-row highlight fills the row's full block (text line + breathing line) with no gap above or between; the header sits directly above the first row.
-  Evidence: `make_row` in `src/ui.rs` uses plain `Row::height(2)` (no header `bottom_margin`, no row `top_margin`), so ratatui's `row_highlight_style` paints the whole 2-line row area. The earlier `header.bottom_margin(1)` and `row.top_margin(1)` attempts both left the margin line outside the highlighted `row_area` (ratatui's `row_area` starts below the margin), which is what created and then widened the gap; both were reverted. A 80x20 tmux capture with ANSI codes shows the selected row's text and breathing lines both `reversed`, edge to edge, with no gap.
+  Evidence: `make_row` in `src/ui.rs` uses plain `Row::height(2)` (no header `bottom_margin`, no row `top_margin`), so the whole 2-line row area is the selection block. The earlier `header.bottom_margin(1)` and `row.top_margin(1)` attempts both left the margin line outside the highlighted `row_area` (ratatui's `row_area` starts below the margin), which is what created and then widened the gap; both were reverted. The selection was later switched from a `reversed` full-row background (which stretched the row and scrambled per-cell colors on hover) to a full-height left-edge `▌` marker in the first column plus bold summary-accent text, so the selection stays contiguous and gap-free without touching row layout.
 - [x] `M7-05` Split the default body layout 70/30 with equal news and sentiment rows.
   Depends on: `M7-01`.
   Acceptance: at 162+ columns the body splits 70% table / 30% right column, and the right column splits into two equal rows (news on top, sentiment below); below 162 columns one focused pane still replaces the table.
@@ -249,7 +249,7 @@ room between the table header and rows.
 - [x] `M7-06` Manual verification of the charts and table across widths and themes.
   Depends on: `M7-02`, `M7-03`, `M7-04`, `M7-05`.
   Acceptance: a fixture-backed walkthrough shows the inline trend sparkline in full mode, the 30-day candlestick chart on the detail screen at compact, standard, and full widths, the gap-free row highlight, and the 70/30 layout, cycling every theme with `NO_COLOR=1` readable.
-  Evidence: a 200x40 tmux run against `scripts/fixture-server.py` (loopback port 8152) showed the full-mode Trend column rendering block glyphs, the selected row's 3-line reversed highlight with no gap, the 70/30 body with news/sentiment in the right rail, and `Enter` opening the detail screen with the 30-day candlestick chart stretching the full column; cycling to `Monochrome` kept everything readable without color. `q`/`Esc` restored the terminal each time.
+  Evidence: a 200x40 tmux run against `scripts/fixture-server.py` (loopback port 8152) showed the full-mode Trend column rendering block glyphs, the selected row's full-height left-edge marker with no gap, the 70/30 body with news/sentiment in the right rail, and `Enter` opening the detail screen with the 30-day candlestick chart stretching the full column; cycling to `Monochrome` kept everything readable without color. `q`/`Esc` restored the terminal each time.
 
 Quality gate `G7`:
 

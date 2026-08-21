@@ -349,7 +349,8 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
     let changes: Vec<f64> = snapshot
         .coins()
         .iter()
-        .filter_map(|coin| finite(coin.ch        .collect();
+        .filter_map(|coin| finite(coin.change_24h()))
+        .collect();
     if changes.is_empty() {
         return vec![Line::styled(
             "No 24h data yet.",
@@ -1207,9 +1208,11 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
         render_no_results(frame, app, area, theme);
         return;
     }
+    let selected = app.selected();
     let rows: Vec<Row<'_>> = coins
         .iter()
-        .map(|coin| make_row(coin, columns, theme))
+        .enumerate()
+        .map(|(index, coin)| make_row(coin, columns, theme, index == selected))
         .collect();
     let row_count = rows.len();
     let widths: Vec<Constraint> = columns
@@ -1219,21 +1222,21 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
     let header = make_header(columns, theme);
     let mut state = TableState::default();
     if !rows.is_empty() {
-        state = TableState::new().with_selected(Some(app.selected()));
+        state = TableState::new().with_selected(Some(selected));
     }
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .highlight_spacing(HighlightSpacing::Never)
-        .row_highlight_style(Style::default().fg(theme.summary).reversed());
+        .highlight_spacing(HighlightSpacing::Never);
     frame.render_stateful_widget(table, area, &mut state);
     render_row_separators(frame, row_count, app.selected(), area, theme);
 }
 
-/// Draw a full-width separator under every visible row except the last one and
-/// the selected row, so plain rows read as Bloomberg-style ledger lines. The
-/// scroll offset mirrors ratatui's: rows are two lines tall below the one-line
-/// header, and the selected row is kept within the visible window.
+/// Draw a full-width separator under every visible row except the last one, so
+/// plain rows read as Bloomberg-style ledger lines. The selected row keeps its
+/// bottom border — only the last row omits it. The scroll offset mirrors
+/// ratatui's: rows are two lines tall below the one-line header, and the
+/// selected row is kept within the visible window.
 fn render_row_separators(
     frame: &mut Frame<'_>,
     rows: usize,
@@ -1261,16 +1264,20 @@ fn render_row_separators(
         if index > last {
             break;
         }
-        if index == last || index == selected {
+        if index == last {
             continue;
         }
+        // The selected row's border stays a clean full-width `─` line; the
+        // left marker lives only on the text line so it does not spill into
+        // the row's border or the row below.
+        let line = Line::from(Span::styled(separator.clone(), style));
         // Below the row's two content lines.
         let y = area.y + HEADER_CHROME + (window as u16) * ROW_HEIGHT + 1;
         if y >= area.y + area.height {
             break;
         }
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(separator.clone(), style))),
+            Paragraph::new(line),
             ratatui::layout::Rect::new(area.x, y, area.width, 1),
         );
     }
@@ -1319,26 +1326,67 @@ fn column_alignment(column: &Column) -> Alignment {
     }
 }
 
-fn make_row(coin: &CoinMarket, columns: &[Column], theme: &Theme) -> Row<'static> {
+fn make_row(coin: &CoinMarket, columns: &[Column], theme: &Theme, selected: bool) -> Row<'static> {
     Row::new(
         columns
             .iter()
-            .map(|column| make_cell(coin, column, theme))
+            .enumerate()
+            .map(|(index, column)| make_cell(coin, column, theme, selected, index == 0))
             .collect::<Vec<_>>(),
     )
     .height(2)
 }
 
-fn make_cell(coin: &CoinMarket, column: &Column, theme: &Theme) -> Cell<'static> {
-    let text = cell_text(coin, column);
-    let line = Line::from(text)
-        .style(cell_style(coin, column, theme))
-        .alignment(column_alignment(column));
-    Cell::new(line)
+/// Render a single two-line cell. The selected row drops its solid background
+/// (which stretched the row and scrambled per-cell colors under `reversed`);
+/// instead the first column carries a `▌` marker and the row's data reads in
+/// the summary accent plus bold. The marker continues onto the row's bottom
+/// border line in `render_row_separators`, so the selection stays one
+/// contiguous left edge while keeping the row's full-width border.
+fn make_cell(
+    coin: &CoinMarket,
+    column: &Column,
+    theme: &Theme,
+    selected: bool,
+    first: bool,
+) -> Cell<'static> {
+    let base = raw_cell_text(coin, column);
+    let style = if selected {
+        selected_cell_style(coin, column, theme)
+    } else {
+        cell_style(coin, column, theme)
+    };
+    let alignment = column_alignment(column);
+    let text = if selected && first {
+        // The marker replaces the leftmost alignment pad so the cell stays at
+        // exactly `column.width`; the breathing line is left blank for the
+        // row-separator border to render under it.
+        let inner_width = column.width.saturating_sub(1);
+        let inner = align_cell(&base, inner_width, column.right);
+        format!("▌{inner}")
+    } else {
+        align_cell(&base, column.width, column.right)
+    };
+    Cell::new(Line::from(text).style(style).alignment(alignment))
 }
 
+/// Selected rows highlight via a full-height left edge, accent foreground, and
+/// bold — never a solid background, which breaks the row's layout on hover.
+/// Cells without a sign-coded value fall back to bold+accent; change cells keep
+/// their gain/loss color while gaining bold weight.
+fn selected_cell_style(coin: &CoinMarket, column: &Column, theme: &Theme) -> Style {
+    let base = cell_style(coin, column, theme);
+    let fg = base.fg.unwrap_or(theme.summary);
+    base.fg(fg).add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
 fn cell_text(coin: &CoinMarket, column: &Column) -> String {
-    let raw = match column.kind {
+    align_cell(&raw_cell_text(coin, column), column.width, column.right)
+}
+
+fn raw_cell_text(coin: &CoinMarket, column: &Column) -> String {
+    match column.kind {
         CellKind::Rank => coin
             .rank()
             .map_or_else(|| "-".into(), |rank| rank.to_string()),
@@ -1352,8 +1400,7 @@ fn cell_text(coin: &CoinMarket, column: &Column) -> String {
         CellKind::Volume => format_compact_money(coin.volume_24h()),
         CellKind::Supply => format_compact_supply(coin.circulating_supply()),
         CellKind::Trend => sparkline_text(coin.sparkline_7d(), column.width as usize),
-    };
-    align_cell(&raw, column.width, column.right)
+    }
 }
 
 const SPARKLINE_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -3050,15 +3097,18 @@ mod tests {
             })
         };
         let selected_y = row_of("Coin 50").expect("selected row scrolled into view");
-        let selected_reversed = (0..width).any(|x| {
+        let selected_marked =
+            (0..width).any(|x| buffer.cell((x, selected_y)).unwrap().symbol().contains('▌'));
+        assert!(selected_marked, "scrolled-to selected row is marked");
+        let selected_bold = (0..width).any(|x| {
             buffer
                 .cell((x, selected_y))
                 .unwrap()
                 .style()
                 .add_modifier
-                .contains(Modifier::REVERSED)
+                .contains(Modifier::BOLD)
         });
-        assert!(selected_reversed, "scrolled-to selected row is highlighted");
+        assert!(selected_bold, "scrolled-to selected row is bold");
         let header_y = row_of("Coin").expect("header visible");
         assert!(
             selected_y > header_y,
@@ -3098,9 +3148,27 @@ mod tests {
                 .unwrap()
                 .style()
                 .add_modifier
-                .contains(Modifier::REVERSED)
+                .contains(Modifier::BOLD)
         });
-        assert!(highlighted, "selected row uses a reversed style");
+        assert!(highlighted, "selected row uses a bold style");
+        let breathing_y = row_y + 1;
+        let breathing: String = (0..width)
+            .map(|x| buffer.cell((x, breathing_y)).unwrap().symbol())
+            .collect();
+        assert!(
+            breathing.contains('─'),
+            "breathing line keeps the bottom border"
+        );
+        assert!(
+            !breathing.contains('▌'),
+            "left marker does not spill into the bottom border"
+        );
+        assert!(
+            !breathing
+                .chars()
+                .any(|c| c.is_ascii_digit() || c.is_ascii_alphabetic()),
+            "breathing line carries only the border, no duplicated row content"
+        );
     }
 
     fn row_input(id: &str, rank: u32, name: &str, symbol: &str, price: f64) -> CoinMarketInput {

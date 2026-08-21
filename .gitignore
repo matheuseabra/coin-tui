@@ -1,3 +1,2 @@
 target/
-.omo/**
-.opencode/agents/**
+logs/
