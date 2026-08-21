@@ -13,7 +13,7 @@ const MAX_SANITIZED_SCALARS: usize = 256;
 use crate::{
     api::ApiError,
     app::{App, DataState, DetailState, MainPane},
-    domain::{daily_candles, CoinMarket},
+    domain::{daily_candles, CoinMarket, PricePoint},
     format::{
         format_age, format_compact_money, format_compact_supply, format_percentage, format_price,
     },
@@ -581,15 +581,30 @@ fn render_detail_main(
 /// The detail chart series: the 30-day market-chart series when it has
 /// landed, otherwise the rich hourly 7-day series, otherwise the row-derived
 /// 7-day series.
-fn detail_series(state: &DetailState) -> &[f64] {
+fn detail_series(state: &DetailState) -> Vec<PricePoint> {
     if !state.chart_30d().is_empty() {
-        return state.chart_30d();
+        return state.chart_30d().to_vec();
     }
     match state {
-        DetailState::Ready { detail, .. } if !detail.sparkline_7d().is_empty() => {
-            detail.sparkline_7d()
-        }
-        _ => state.base().sparkline_7d(),
+        DetailState::Ready { detail, .. } if !detail.sparkline_7d().is_empty() => detail
+            .sparkline_7d()
+            .iter()
+            .enumerate()
+            .map(|(index, &price)| PricePoint {
+                timestamp: index as f64 * 3_600_000.0,
+                price,
+            })
+            .collect(),
+        _ => state
+            .base()
+            .sparkline_7d()
+            .iter()
+            .enumerate()
+            .map(|(index, &price)| PricePoint {
+                timestamp: index as f64 * 3_600_000.0,
+                price,
+            })
+            .collect(),
     }
 }
 
@@ -642,7 +657,7 @@ fn detail_candles(state: &DetailState) -> Option<DetailCandles> {
     let series = detail_series(state);
     let values: Vec<f64> = series
         .iter()
-        .copied()
+        .map(|point| point.price)
         .filter(|value| value.is_finite())
         .collect();
     if values.is_empty() {
@@ -650,7 +665,7 @@ fn detail_candles(state: &DetailState) -> Option<DetailCandles> {
     }
     let low = values.iter().copied().fold(f64::INFINITY, f64::min);
     let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let bars = daily_candles(&values)
+    let bars = daily_candles(&series)
         .into_iter()
         .map(|candle| chandelier::Candle::new(candle.open, candle.high, candle.low, candle.close))
         .collect();

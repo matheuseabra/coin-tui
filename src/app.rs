@@ -18,7 +18,7 @@ use crate::news::NoNewsProvider;
 use crate::{
     api::{ApiError, CoinGeckoClient, FetchOutcome, MarketData},
     config::Config,
-    domain::{CoinDetail, CoinMarket, MarketSnapshot},
+    domain::{CoinDetail, CoinMarket, MarketSnapshot, PricePoint},
     log::FileLog,
     news::{NewsItem, NewsProvider, RssNewsClient},
     theme::{Theme, THEMES},
@@ -44,7 +44,7 @@ pub enum Event {
     ChartResult {
         id: String,
         generation: u64,
-        result: Result<Vec<f64>, ApiError>,
+        result: Result<Vec<PricePoint>, ApiError>,
     },
     NewsResult {
         generation: u64,
@@ -99,12 +99,12 @@ pub enum DetailState {
     Basic(CoinMarket),
     Loading {
         base: CoinMarket,
-        chart_30d: Vec<f64>,
+        chart_30d: Vec<PricePoint>,
     },
     Ready {
         base: CoinMarket,
         detail: Box<CoinDetail>,
-        chart_30d: Vec<f64>,
+        chart_30d: Vec<PricePoint>,
     },
 }
 
@@ -127,7 +127,7 @@ impl DetailState {
 
     /// The optional 30-day price series for the candlestick chart, empty when
     /// the market-chart fetch has not landed or is unsupported.
-    pub fn chart_30d(&self) -> &[f64] {
+    pub fn chart_30d(&self) -> &[PricePoint] {
         match self {
             DetailState::Loading { chart_30d, .. } | DetailState::Ready { chart_30d, .. } => {
                 chart_30d
@@ -3464,7 +3464,12 @@ mod tests {
         app.update(Event::ChartResult {
             id: "bitcoin".to_owned(),
             generation,
-            result: Ok((0..720).map(|i| 1000.0 + i as f64).collect()),
+            result: Ok((0..720)
+                .map(|i| PricePoint {
+                    timestamp: i as f64 * 3_600_000.0,
+                    price: 1000.0 + i as f64,
+                })
+                .collect()),
         });
         assert_eq!(
             app.detail_state().unwrap().chart_30d().len(),

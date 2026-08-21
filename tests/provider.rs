@@ -2,6 +2,8 @@
 mod api;
 #[path = "../src/domain.rs"]
 mod domain;
+#[path = "../src/http.rs"]
+mod http;
 #[path = "../src/news.rs"]
 mod news;
 
@@ -981,7 +983,20 @@ async fn fetch_market_chart_requests_path_query_and_key_and_extracts_prices() {
         .unwrap();
     assert_eq!(
         prices,
-        vec![50000.0, 51000.0, 52000.0],
+        vec![
+            domain::PricePoint {
+                timestamp: 1_700_000_000_000.0,
+                price: 50000.0
+            },
+            domain::PricePoint {
+                timestamp: 1_700_036_400_000.0,
+                price: 51000.0
+            },
+            domain::PricePoint {
+                timestamp: 1_700_108_400_000.0,
+                price: 52000.0
+            },
+        ],
         "null prices are dropped"
     );
 
@@ -1204,7 +1219,9 @@ async fn rss_client_classifies_rate_limit_server_error_and_timeout() {
         .await;
     assert_eq!(
         news_client(&limited).fetch_headlines().await.unwrap_err(),
-        ApiError::RateLimited { retry_after: None }
+        ApiError::RateLimited {
+            retry_after: Some(Duration::from_secs(5))
+        }
     );
     let failed = MockServer::start().await;
     Mock::given(method("GET"))

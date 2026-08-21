@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod domain;
 mod format;
+mod http;
 mod log;
 mod news;
 mod theme;

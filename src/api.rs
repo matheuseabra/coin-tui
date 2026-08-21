@@ -3,12 +3,13 @@
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 
 use chrono::{DateTime, TimeZone, Utc};
-use reqwest::{header, redirect::Policy, StatusCode, Url};
+use reqwest::Url;
 use serde::Deserialize;
 
 use crate::domain::{
-    CoinDetail, CoinDetailInput, CoinMarketInput, MarketSnapshot, MarketSummaryInput,
+    CoinDetail, CoinDetailInput, CoinMarketInput, MarketSnapshot, MarketSummaryInput, PricePoint,
 };
+use crate::http::{validate_url, HttpClient};
 
 const MARKETS_PATH: &str = "api/v3/coins/markets";
 const GLOBAL_PATH: &str = "api/v3/global";
@@ -63,10 +64,9 @@ impl std::error::Error for ApiError {}
 /// Reusable CoinGecko client. The key is kept only in the request header and
 /// is intentionally absent from this type's formatting implementations.
 pub struct CoinGeckoClient {
-    client: reqwest::Client,
+    client: HttpClient,
     base_url: Url,
     api_key: Option<String>,
-    total_timeout: Duration,
 }
 
 impl CoinGeckoClient {
@@ -85,19 +85,12 @@ impl CoinGeckoClient {
         connect_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Self, ApiError> {
-        let base_url = validate_http_url(base_url)?;
-        if tokio::time::Instant::now()
-            .checked_add(total_timeout)
-            .is_none()
-        {
-            return Err(ApiError::InvalidTimeoutConfiguration);
-        }
-        let client = build_http_client(connect_timeout)?;
+        let base_url = validate_url(base_url)?;
+        let client = HttpClient::new(connect_timeout, total_timeout)?;
         Ok(Self {
             client,
             base_url,
             api_key,
-            total_timeout,
         })
     }
 
@@ -143,7 +136,7 @@ impl CoinGeckoClient {
     /// Price history for the detail chart (`GET /coins/{id}/market_chart`),
     /// `days=30`, so the candlestick chart has enough candles to stretch the
     /// pane. Returns just the `prices` series as (timestamp, price) pairs.
-    pub async fn fetch_market_chart(&self, id: &str) -> Result<Vec<f64>, ApiError> {
+    pub async fn fetch_market_chart(&self, id: &str) -> Result<Vec<PricePoint>, ApiError> {
         let mut url = self.coin_detail_url(id)?;
         url.path_segments_mut()
             .map_err(|_| ApiError::InvalidBaseUrl)?
@@ -154,9 +147,15 @@ impl CoinGeckoClient {
         Ok(chart
             .prices
             .into_iter()
-            .filter_map(|pair| pair.into_iter().nth(1))
-            .flatten()
-            .filter(|value| value.is_finite())
+            .filter_map(|pair| {
+                let mut values = pair.into_iter();
+                let timestamp = values.next().flatten()?;
+                let price = values.next().flatten()?;
+                if !timestamp.is_finite() || !price.is_finite() {
+                    return None;
+                }
+                Some(PricePoint { timestamp, price })
+            })
             .collect())
     }
 
@@ -241,41 +240,17 @@ impl CoinGeckoClient {
         url: Url,
         query: &[(&str, &str)],
     ) -> Result<T, ApiError> {
-        let mut request = self.client.get(url).query(query);
-        if let Some(key) = &self.api_key {
-            request = request.header("x-cg-demo-api-key", key);
-        }
-        match tokio::time::timeout(self.total_timeout, async move {
-            let response = request.send().await.map_err(classify_request_error)?;
-            let status = response.status();
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(ApiError::RateLimited {
-                    retry_after: parse_retry_after(response.headers()),
-                });
-            }
-            if !status.is_success() {
-                return Err(ApiError::HttpStatus {
-                    status: status.as_u16(),
-                });
-            }
-            if !is_json_content_type(response.headers()) {
-                return Err(ApiError::MalformedResponse);
-            }
-            let mut body = Vec::new();
-            let mut response = response;
-            while let Some(chunk) = response.chunk().await.map_err(classify_request_error)? {
-                if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(body.len()) {
-                    return Err(ApiError::MalformedResponse);
-                }
-                body.extend_from_slice(&chunk);
-            }
-            serde_json::from_slice(&body).map_err(|_| ApiError::MalformedResponse)
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(ApiError::Timeout),
-        }
+        let body = self
+            .client
+            .get(
+                url,
+                query,
+                self.api_key.as_deref(),
+                MAX_RESPONSE_BYTES,
+                true,
+            )
+            .await?;
+        serde_json::from_slice(&body).map_err(|_| ApiError::MalformedResponse)
     }
 }
 
@@ -304,7 +279,7 @@ pub trait MarketData: Send + Sync {
     fn fetch_market_chart<'a>(
         &'a self,
         _id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<f64>, ApiError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PricePoint>, ApiError>> + Send + 'a>> {
         Box::pin(async move { Err(ApiError::HttpStatus { status: 501 }) })
     }
 }
@@ -326,70 +301,8 @@ impl MarketData for CoinGeckoClient {
     fn fetch_market_chart<'a>(
         &'a self,
         id: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<f64>, ApiError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<PricePoint>, ApiError>> + Send + 'a>> {
         Box::pin(CoinGeckoClient::fetch_market_chart(self, id))
-    }
-}
-
-/// Validate the shared HTTP URL rules: an absolute URL with a host, no
-/// credentials, and an HTTPS scheme (raw HTTP only for loopback hosts so a
-/// fixture server is usable offline).
-pub(crate) fn validate_http_url(raw: &str) -> Result<Url, ApiError> {
-    let url = Url::parse(raw).map_err(|_| ApiError::InvalidBaseUrl)?;
-    let allowed_http = url.scheme() == "http" && url.host().map(is_loopback_host).unwrap_or(false);
-    if url.scheme() != "https" && !allowed_http
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return Err(ApiError::InvalidBaseUrl);
-    }
-    Ok(url)
-}
-
-/// A no-redirect HTTP client with the shared user agent and connect timeout.
-pub(crate) fn build_http_client(connect_timeout: Duration) -> Result<reqwest::Client, ApiError> {
-    reqwest::Client::builder()
-        .user_agent("coin-tui/0.1")
-        .redirect(Policy::none())
-        .connect_timeout(connect_timeout)
-        .build()
-        .map_err(|_| ApiError::Transport)
-}
-
-pub(crate) fn classify_request_error(error: reqwest::Error) -> ApiError {
-    if error.is_timeout() {
-        ApiError::Timeout
-    } else {
-        ApiError::Transport
-    }
-}
-
-fn parse_retry_after(headers: &header::HeaderMap) -> Option<Duration> {
-    let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds));
-    }
-    let date = httpdate::parse_http_date(value).ok()?;
-    Some(
-        date.duration_since(std::time::SystemTime::now())
-            .unwrap_or_default(),
-    )
-}
-
-fn is_json_content_type(headers: &header::HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
-}
-
-fn is_loopback_host(host: url::Host<&str>) -> bool {
-    match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(address) => address == std::net::Ipv4Addr::LOCALHOST,
-        url::Host::Ipv6(address) => address.is_loopback(),
     }
 }
 

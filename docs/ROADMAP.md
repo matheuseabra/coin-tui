@@ -256,6 +256,35 @@ Quality gate `G7`:
 - [ ] All M7 tasks are accepted.
 - [ ] The baseline checks in `docs/TESTING.md` pass with the new charts.
 
+## M8: Architecture Deepening
+
+Goal: improve locality and leverage at the seams identified in the architecture
+review without changing the read-only product contract.
+
+- [x] `M8-01` Centralize bounded HTTP transport for market and news adapters.
+  Depends on: `G7`.
+  Acceptance: URL policy, no-redirect client construction, timeout handling, status classification, `Retry-After`, content-type checks, and response-size limits have one implementation used by both providers; provider tests keep endpoint and conversion coverage.
+  Evidence: Added `src/http.rs` with the shared `HttpClient` implementation. `CoinGeckoClient` and `RssNewsClient` now use the same transport seam; no provider imports another provider's private HTTP helpers. Existing market/news tests cover JSON and RSS responses, malformed content, oversized bodies, transport errors, timeouts, redirects, API-key headers, and rate limits.
+- [x] `M8-02` Preserve timestamps when deriving historical candles.
+  Depends on: `M7-03`.
+  Acceptance: historical price points retain provider timestamps; candle grouping uses timestamp windows, remains bounded, sorts unsorted input, and ignores non-finite points.
+  Evidence: Added domain `PricePoint` values and timestamp-window `daily_candles` aggregation. The chart provider now rejects non-finite timestamps/prices while preserving valid timestamps; fallback sparkline values receive synthetic hourly timestamps. Added irregular and unsorted point coverage. Final verification passed `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` with 201 tests (149 unit + 52 provider).
+- [ ] `M8-03` Deepen the operation lifecycle seam.
+  Depends on: `M8-01`.
+  Acceptance: market, news, detail, and chart task spawning, cancellation, generation checks, and stale-result handling use one internal lifecycle implementation; App-level behavior remains unchanged.
+- [ ] `M8-04` Separate pure UI projection from Ratatui widget emission.
+  Depends on: `M8-02`.
+  Acceptance: market, detail, sentiment, and news projections have pure test surfaces; `ui.rs` retains layout and widget emission, with visible rendering unchanged at all required sizes.
+- [ ] `M8-05` Split application transitions into focused private modules.
+  Depends on: `M8-03`, `M8-04`.
+  Acceptance: App remains the single state owner while input, refresh, detail, and pane transitions gain narrow interfaces and cross-module behavior remains covered through App integration tests.
+
+Quality gate `G8`:
+
+- [ ] All M8 tasks are accepted.
+- [ ] The baseline checks in `docs/TESTING.md` pass after each accepted architecture change.
+- [ ] No user-facing behavior, terminal lifecycle guarantee, or provider security guarantee regresses.
+
 ## Deferred Tracks
 
 These items require a new milestone and acceptance criteria. They are not implicit MVP work:

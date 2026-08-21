@@ -56,7 +56,7 @@ Refreshing a ready, empty, or stale state keeps the snapshot visible and sets `f
 
 `Enter` on a selected row stores a clone of the selected `CoinMarket` in `App.detail` as `DetailState::Basic`; `Esc` clears it. Opening and closing never touch `selected`, so the table's selection and viewport are preserved across the transition. While `detail` is set the input update is modal: navigation, search, and sort keys fall through to `Command::None`, while `r`, `?`, `q`, and `Esc` remain active. A successful refresh replaces the stored coin's base row with the matching-ID row from the new snapshot, so the pane stays fresh without holding a second query to the provider.
 
-The detail screen follows the CoinMarketCap coin-detail shape: identity header, price with its 24-hour change, the 1h/24h/7d change strip, a candlestick chart, and a market-stats grid — all inside a left-aligned content column capped at `DETAIL_CONTENT_WIDTH = 56`, so the page never stretches with the terminal and the chart hugs the pane's left border. The chart is a `chandelier::CandlestickChart` (`render_detail_chart` in `ui.rs`) drawn from daily OHLC candles derived by `daily_candles` in `src/domain.rs`. The preferred series is the 30-day price history fetched on demand from `GET /coins/{id}/market_chart` (`fetch_market_chart` in `api.rs`), which yields up to `MAX_DAILY_CANDLES = 30` candles so the chart stretches the full content column; when that fetch is unsupported or fails, the chart falls back to the already-normalized hourly `sparkline_7d` series bucketed one candle per 24 hourly points. Hostile, empty, overflowing, or gigantic series stay bounded and cannot panic or overflow the renderer; a flat or tiny series collapses to a single flat candle that renders as a mid-line, and an all-missing series shows the placeholder message. The chart's bull/bear/wick styles use the `theme.gain`/`theme.loss`/`trend_color` roles so it recolors with every theme and stays readable without color (`Monochrome` maps all roles to `Color::Reset`). The chart draws its own autoscaling price axis and time axis, right-aligning the newest candles; a `7 days` or `30 days: low → high` caption line below uses the real series low/high and the summary accent.
+The detail screen follows the CoinMarketCap coin-detail shape: identity header, price with its 24-hour change, the 1h/24h/7d change strip, a candlestick chart, and a market-stats grid — all inside a left-aligned content column capped at `DETAIL_CONTENT_WIDTH = 56`, so the page never stretches with the terminal and the chart hugs the pane's left border. The chart is a `chandelier::CandlestickChart` (`render_detail_chart` in `ui.rs`) drawn from daily OHLC candles derived by `daily_candles` in `src/domain.rs`. The preferred series is the 30-day price history fetched on demand from `GET /coins/{id}/market_chart` (`fetch_market_chart` in `api.rs`), which preserves provider timestamps as `PricePoint` values and groups irregular samples by timestamp windows into at most `MAX_DAILY_CANDLES = 30` candles. When that fetch is unsupported or fails, the chart falls back to the already-normalized hourly `sparkline_7d` series with synthetic hourly timestamps. Hostile, empty, overflowing, or gigantic series stay bounded and cannot panic or overflow the renderer; a flat or tiny series collapses to a single flat candle that renders as a mid-line, and an all-missing series shows the placeholder message. The chart's bull/bear/wick styles use the `theme.gain`/`theme.loss`/`trend_color` roles so it recolors with every theme and stays readable without color (`Monochrome` maps all roles to `Color::Reset`). The chart draws its own autoscaling price axis and time axis, right-aligning the newest candles; a `7 days` or `30 days: low → high` caption line below uses the real series low/high and the summary accent.
 
 #### Rich Detail Sidebar
 
@@ -84,7 +84,8 @@ src/
 |-- app.rs           # App, Event, Command, update, selection, sorting, panes
 |-- tui.rs           # terminal enter/restore and Crossterm event stream
 |-- api.rs           # MarketData trait, CoinGecko client and DTO conversion
-|-- domain.rs        # provider-independent market and detail types
+|-- domain.rs        # provider-independent market, detail, and price-series types
+|-- http.rs          # shared bounded HTTP transport and URL policy
 |-- news.rs          # NewsProvider trait, RSS client and bounded parsing
 |-- format.rs        # deterministic money, percentage and supply formatting
 |-- log.rs           # redacted file tracing
@@ -203,6 +204,10 @@ Planned production dependencies are added only with the roadmap task that uses t
 | `color-eyre` | Error reports while preserving terminal cleanup. |
 
 Redacted file tracing intentionally uses no `tracing`/`tracing-subscriber`; the self-contained `FileLog` in `src/log.rs` keeps the dependency set smallest while meeting the tracing acceptance.
+
+### Shared HTTP Transport
+
+`src/http.rs` owns URL validation, no-redirect client construction, timeout handling, status classification, `Retry-After` parsing, content-type checks, and bounded response reads. `CoinGeckoClient` and `RssNewsClient` are provider adapters over this implementation; provider modules keep only endpoint paths, headers, DTO conversion, and RSS parsing. This keeps security and resilience fixes local to one seam without adding a production dependency.
 
 Expected development dependencies are `wiremock` for HTTP-boundary tests and `tempfile` for isolated files; both are in use. The `tokio` `test-util` feature (dev-only) enables paused-time tests for refresh scheduling. Add `insta`, `proptest`, Axum, or a database only when a roadmap task demonstrates a concrete need.
 

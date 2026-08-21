@@ -379,7 +379,14 @@ fn normalize_coin(coin: CoinMarketInput) -> CoinMarket {
     }
 }
 
-/// An open/high/low/close bar derived from the hourly 7-day price series.
+/// A normalized historical price point from a provider response.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PricePoint {
+    pub timestamp: f64,
+    pub price: f64,
+}
+
+/// An open/high/low/close bar derived from a historical price series.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Candle {
     pub open: f64,
@@ -393,46 +400,61 @@ pub struct Candle {
 /// thirty daily candles.
 pub const MAX_DAILY_CANDLES: usize = 30;
 
-/// Hourly points in one day; `daily_candles` buckets by this granularity.
-const HOURLY_POINTS_PER_DAY: usize = 24;
-
-/// Aggregate the finite hourly closes into daily candles: the first point of a
-/// bucket is the open, the max is the high, the min is the low, and the last
-/// point is the close. A day is 24 hourly points, so a 30-day series yields
-/// thirty candles (capped at `MAX_DAILY_CANDLES`); fewer points collapse into
-/// fewer candles (a flat or tiny series becomes one flat candle that a chart
-/// renders as a mid-line). Non-finite points are dropped (matching the domain
-/// boundary); an empty or all-non-finite series yields no candles.
-pub fn daily_candles(series: &[f64]) -> Vec<Candle> {
-    let values: Vec<f64> = series
+/// Aggregate finite points into daily candles using timestamp windows. The
+/// first point in each window is the open, the max is the high, the min is the
+/// low, and the last is the close. Unsorted points are ordered by timestamp;
+/// invalid points are dropped and output remains capped.
+pub fn daily_candles(series: &[PricePoint]) -> Vec<Candle> {
+    let mut values: Vec<PricePoint> = series
         .iter()
         .copied()
-        .filter(|value| value.is_finite())
+        .filter(|point| point.timestamp.is_finite() && point.price.is_finite())
         .collect();
     if values.is_empty() {
         return Vec::new();
     }
-    // One bucket per 24 hourly points (a day), capped so hostile series stay
-    // bounded; anything shorter than a day becomes a single candle.
-    let days = values
-        .len()
-        .div_ceil(HOURLY_POINTS_PER_DAY)
-        .min(MAX_DAILY_CANDLES);
-    let bucket_size = values.len().div_ceil(days);
-    let mut candles = Vec::with_capacity(days);
-    for chunk in values.chunks(bucket_size) {
-        let open = chunk[0];
-        let close = *chunk.last().unwrap();
-        let high = chunk.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let low = chunk.iter().copied().fold(f64::INFINITY, f64::min);
-        candles.push(Candle {
-            open,
-            high,
-            low,
-            close,
-        });
+    values.sort_by(|left, right| left.timestamp.total_cmp(&right.timestamp));
+    let start = values[0].timestamp;
+    let day = 86_400_000.0;
+    let mut candles = Vec::new();
+    let mut bucket = Vec::new();
+    let mut bucket_index = 0.0;
+    for point in values {
+        while point.timestamp >= start + (bucket_index + 1.0) * day {
+            if !bucket.is_empty() {
+                candles.push(candle_from_points(&bucket));
+                bucket.clear();
+            }
+            bucket_index += 1.0;
+            if candles.len() == MAX_DAILY_CANDLES {
+                return candles;
+            }
+        }
+        bucket.push(point);
+    }
+    if !bucket.is_empty() && candles.len() < MAX_DAILY_CANDLES {
+        candles.push(candle_from_points(&bucket));
     }
     candles
+}
+
+fn candle_from_points(points: &[PricePoint]) -> Candle {
+    let open = points[0].price;
+    let close = points[points.len() - 1].price;
+    let high = points
+        .iter()
+        .map(|point| point.price)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let low = points
+        .iter()
+        .map(|point| point.price)
+        .fold(f64::INFINITY, f64::min);
+    Candle {
+        open,
+        high,
+        low,
+        close,
+    }
 }
 
 #[cfg(test)]
@@ -695,7 +717,12 @@ mod tests {
     #[test]
     fn daily_candles_aggregate_hourly_closes_into_ohlc() {
         // One week of hourly points, so every hour maps to one of seven days.
-        let week: Vec<f64> = (0..168).map(|hour| hour as f64).collect();
+        let week: Vec<PricePoint> = (0..168)
+            .map(|hour| PricePoint {
+                timestamp: hour as f64 * 3_600_000.0,
+                price: hour as f64,
+            })
+            .collect();
         let candles = daily_candles(&week);
         assert_eq!(candles.len(), 7, "one candle per day");
         assert_eq!(
@@ -725,12 +752,30 @@ mod tests {
     #[test]
     fn daily_candles_bounded_flat_empty_and_hostile_series() {
         // A long series caps at MAX_DAILY_CANDLES.
-        let long: Vec<f64> = (0..1000).map(|index| index as f64).collect();
+        let long: Vec<PricePoint> = (0..1000)
+            .map(|index| PricePoint {
+                timestamp: index as f64 * 3_600_000.0,
+                price: index as f64,
+            })
+            .collect();
         assert_eq!(daily_candles(&long).len(), MAX_DAILY_CANDLES);
 
         // A flat series collapses to one flat candle (a chart mid-line).
         assert_eq!(
-            daily_candles(&[5.0, 5.0, 5.0]),
+            daily_candles(&[
+                PricePoint {
+                    timestamp: 0.0,
+                    price: 5.0
+                },
+                PricePoint {
+                    timestamp: 1.0,
+                    price: 5.0
+                },
+                PricePoint {
+                    timestamp: 2.0,
+                    price: 5.0
+                },
+            ]),
             vec![Candle {
                 open: 5.0,
                 high: 5.0,
@@ -741,7 +786,10 @@ mod tests {
 
         // A single point is one flat candle.
         assert_eq!(
-            daily_candles(&[7.0]),
+            daily_candles(&[PricePoint {
+                timestamp: 0.0,
+                price: 7.0
+            }]),
             vec![Candle {
                 open: 7.0,
                 high: 7.0,
@@ -752,10 +800,45 @@ mod tests {
 
         // Empty and all-non-finite series have nothing to plot.
         assert!(daily_candles(&[]).is_empty());
-        assert!(daily_candles(&[f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).is_empty());
+        assert!(daily_candles(&[
+            PricePoint {
+                timestamp: f64::NAN,
+                price: 1.0
+            },
+            PricePoint {
+                timestamp: 0.0,
+                price: f64::INFINITY
+            },
+            PricePoint {
+                timestamp: 0.0,
+                price: f64::NEG_INFINITY
+            },
+        ])
+        .is_empty());
 
         // Non-finite points are dropped before bucketing.
-        let mixed = daily_candles(&[f64::NAN, 1.0, 2.0, f64::INFINITY, 3.0]);
+        let mixed = daily_candles(&[
+            PricePoint {
+                timestamp: 0.0,
+                price: f64::NAN,
+            },
+            PricePoint {
+                timestamp: 1.0,
+                price: 1.0,
+            },
+            PricePoint {
+                timestamp: 2.0,
+                price: 2.0,
+            },
+            PricePoint {
+                timestamp: 3.0,
+                price: f64::INFINITY,
+            },
+            PricePoint {
+                timestamp: 4.0,
+                price: 3.0,
+            },
+        ]);
         assert_eq!(mixed.len(), 1);
         assert_eq!(
             mixed[0],
@@ -765,6 +848,45 @@ mod tests {
                 low: 1.0,
                 close: 3.0
             }
+        );
+    }
+
+    #[test]
+    fn daily_candles_group_irregular_unsorted_points_by_timestamp() {
+        let candles = daily_candles(&[
+            PricePoint {
+                timestamp: 86_400_000.0 + 2.0,
+                price: 30.0,
+            },
+            PricePoint {
+                timestamp: 1.0,
+                price: 10.0,
+            },
+            PricePoint {
+                timestamp: 86_400_000.0 + 1.0,
+                price: 20.0,
+            },
+            PricePoint {
+                timestamp: 2.0,
+                price: 15.0,
+            },
+        ]);
+        assert_eq!(
+            candles,
+            vec![
+                Candle {
+                    open: 10.0,
+                    high: 15.0,
+                    low: 10.0,
+                    close: 15.0
+                },
+                Candle {
+                    open: 20.0,
+                    high: 30.0,
+                    low: 20.0,
+                    close: 30.0
+                },
+            ]
         );
     }
 }

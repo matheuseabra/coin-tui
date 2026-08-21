@@ -13,7 +13,10 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use reqwest::Url;
 
-use crate::api::{build_http_client, classify_request_error, validate_http_url, ApiError};
+use crate::{
+    api::ApiError,
+    http::{validate_url, HttpClient},
+};
 
 const MAX_FEED_BYTES: usize = 1024 * 1024;
 /// Headlines shown per refresh, so a chatty feed cannot grow the pane state.
@@ -81,9 +84,8 @@ impl NewsProvider for NoNewsProvider {
 }
 
 pub struct RssNewsClient {
-    client: reqwest::Client,
+    client: HttpClient,
     feed_url: Url,
-    total_timeout: Duration,
 }
 
 impl RssNewsClient {
@@ -96,19 +98,9 @@ impl RssNewsClient {
         connect_timeout: Duration,
         total_timeout: Duration,
     ) -> Result<Self, ApiError> {
-        let feed_url = validate_http_url(feed_url)?;
-        if tokio::time::Instant::now()
-            .checked_add(total_timeout)
-            .is_none()
-        {
-            return Err(ApiError::InvalidTimeoutConfiguration);
-        }
-        let client = build_http_client(connect_timeout)?;
-        Ok(Self {
-            client,
-            feed_url,
-            total_timeout,
-        })
+        let feed_url = validate_url(feed_url)?;
+        let client = HttpClient::new(connect_timeout, total_timeout)?;
+        Ok(Self { client, feed_url })
     }
 
     pub async fn fetch_headlines(&self) -> Result<Vec<NewsItem>, ApiError> {
@@ -121,33 +113,9 @@ impl RssNewsClient {
     }
 
     async fn fetch_body(&self) -> Result<Vec<u8>, ApiError> {
-        tokio::time::timeout(self.total_timeout, async {
-            let response = self
-                .client
-                .get(self.feed_url.clone())
-                .send()
-                .await
-                .map_err(classify_request_error)?;
-            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(ApiError::RateLimited { retry_after: None });
-            }
-            if !response.status().is_success() {
-                return Err(ApiError::HttpStatus {
-                    status: response.status().as_u16(),
-                });
-            }
-            let mut body = Vec::new();
-            let mut response = response;
-            while let Some(chunk) = response.chunk().await.map_err(classify_request_error)? {
-                if chunk.len() > MAX_FEED_BYTES.saturating_sub(body.len()) {
-                    return Err(ApiError::MalformedResponse);
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(body)
-        })
-        .await
-        .map_err(|_| ApiError::Timeout)?
+        self.client
+            .get(self.feed_url.clone(), &[], None, MAX_FEED_BYTES, false)
+            .await
     }
 }
 
