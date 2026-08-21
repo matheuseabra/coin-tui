@@ -59,7 +59,7 @@ The summary provides context. The table is the primary surface. Color reinforces
 | Width | Layout |
 | --- | --- |
 | `< 80` columns | Compact table: rank, symbol, price, and 24-hour change. The summary becomes one status line and the sparkline is hidden. |
-| `80..119` columns | Standard table: name and symbol, price, 1-hour, 24-hour, 7-day, and market cap. |
+| `80..119` columns | Standard table: name and symbol, price, 1-hour, 24-hour, 7-day, market cap, and 24-hour volume. |
 | `>= 120` columns | Full table: standard columns plus volume, supply, and sparkline. |
 
 The minimum supported terminal is 60 columns by 16 rows. Below that size, the product shows a centered resize message and keeps quit handling active.
@@ -81,6 +81,7 @@ The minimum supported terminal is 60 columns by 16 rows. Below that size, the pr
 | `r` | Request a refresh unless one is active or cooling down. |
 | `t`, `Shift-T` | Cycle the color theme forward or backward. |
 | `Tab`, `Shift-Tab` | Move pane focus forward or backward between the market table, news, and sentiment panes. |
+| `Up`, `Down`, `PageUp`, `PageDown`, `Home`, `End` | Scroll the news pane when it is focused. |
 | `?` | Toggle keybinding help. |
 
 ## Coin Detail
@@ -95,7 +96,7 @@ At wide panes the detail screen adds a right-hand `Coin data` column fed by the 
 
 `Tab` and `Shift-Tab` move focus between three panes: the market table, a news wire, and a market-breadth sentiment pane. On terminals at least 162 columns wide the news and sentiment panes render beside the table in a right column (the body splits 70/30 — table 70%, panes 30% — and the right column divides into two equal rows, news on top, sentiment below), and focus highlights the active pane's border and title; on narrower terminals one focused pane replaces the table at a time so the table keeps its full column set. Focus is keyboard-only and modal: pane keys are swallowed while searching, while help is open, or on the coin detail screen.
 
-The news pane shows the latest headlines from the configured RSS feed (`--news-url`, default CoinDesk). Each headline renders the bounded title first, wraps it to the pane width, then shows a `source · age` metadata line such as `2h` or `2d`, followed by the bounded URL. Before the first result the pane shows a loading placeholder, after a failed refresh it keeps the last headlines and appends a one-line failure notice, and with the feed disabled it says the feed is unavailable.
+The news pane shows the latest headlines from the configured RSS feed (`--news-url`, default CoinDesk). Each headline renders the bounded title first, wraps it to the pane width, then shows a `source · age` metadata line such as `2h` or `2d`, followed by the bounded URL. When focused, the pane scrolls with directional and page keys; `Home` and `End` move to the first and last content. Before the first result the pane shows a loading placeholder, after a failed refresh it keeps the last headlines and appends a one-line failure notice, and with the feed disabled it says the feed is unavailable.
 
 The sentiment pane computes 24-hour market breadth from the current snapshot: up/down/flat counts, a bullish-share meter, the average 24-hour change, and the best and worst mover. It needs no second provider; with no market rows or no finite 24-hour changes it shows a placeholder. News and sentiment are informational; news links are displayed, never opened.
 

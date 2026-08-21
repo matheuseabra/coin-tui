@@ -255,6 +255,7 @@ fn render_market(
 /// disabled, still loading, failed, or empty.
 fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
     let theme = app.theme();
+    let inner_width = area.width.saturating_sub(2);
     let projection = view::news(app.news_feed(), app.news_enabled());
     let mut lines = Vec::new();
     for item in &projection.items {
@@ -288,9 +289,14 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
             ));
         }
     }
+    let content_rows = wrapped_rows(&lines, inner_width);
+    let visible_rows = area.height.saturating_sub(2);
+    let max_scroll = content_rows.saturating_sub(visible_rows);
+    let scroll = app.news_scroll().min(max_scroll);
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .block(pane_block("News", focused, theme)),
         area,
     );
@@ -994,7 +1000,7 @@ const COMPACT_COLUMNS: [Column; 4] = [
     },
 ];
 
-const STANDARD_COLUMNS: [Column; 8] = [
+const STANDARD_COLUMNS: [Column; 9] = [
     Column {
         title: "#",
         width: 3,
@@ -1042,6 +1048,12 @@ const STANDARD_COLUMNS: [Column; 8] = [
         width: 8,
         right: true,
         kind: CellKind::Cap,
+    },
+    Column {
+        title: "Vol",
+        width: 9,
+        right: true,
+        kind: CellKind::Volume,
     },
 ];
 
@@ -1176,9 +1188,14 @@ fn render_table(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, w
     if !rows.is_empty() {
         state = TableState::new().with_selected(Some(selected));
     }
+    let spacing = if matches!(TableMode::for_width(width), TableMode::Standard) {
+        0
+    } else {
+        1
+    };
     let table = Table::new(rows, widths)
         .header(header)
-        .column_spacing(1)
+        .column_spacing(spacing)
         .highlight_spacing(HighlightSpacing::Never);
     frame.render_stateful_widget(table, area, &mut state);
     render_row_separators(frame, row_count, app.selected(), area, theme);
@@ -3825,6 +3842,26 @@ mod tests {
             "{rendered:?}"
         );
         assert!(rendered.contains("News refresh failed"), "{rendered:?}");
+    }
+
+    #[test]
+    fn news_pane_scrolls_through_long_feeds() {
+        let mut app = news_app(20);
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        )));
+        let first = text_at(&app, 60, 16);
+        assert!(first.contains("Headline 0 about markets"), "{first:?}");
+        assert!(!first.contains("Headline 19 about markets"), "{first:?}");
+
+        app.update(Event::Input(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )));
+        let later = text_at(&app, 60, 16);
+        assert!(app.news_scroll() > 0);
+        assert!(later.contains("Headline 6 about markets"), "{later:?}");
     }
 
     #[test]

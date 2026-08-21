@@ -72,6 +72,7 @@ At each UI quality gate, run the keyboard-only path from `PRODUCT.md` with fixtu
 
 - resize across compact, standard, and full modes;
 - `Tab`/`Shift-Tab` cycle the news and sentiment panes: below 162 columns only the focused pane renders, at 162+ the panes sit beside the table, and the pane keys are swallowed while searching, while help is open, and on the detail screen;
+- the standard table includes 24-hour volume, and a focused news pane scrolls with arrows, page keys, `Home`, and `End` through a long feed;
 - the news pane shows headline source/age/title/URL lines, a loading placeholder before the first result, and a failure notice that keeps the last headlines;
 - the sentiment pane shows the up/down/flat counts, the bullish meter, and the best/worst mover, with placeholders when there are no rows or no finite 24-hour changes;
 - open the coin detail screen at each width and confirm the left-aligned, width-limited candlestick chart with the `7 days` caption, the price with its 24-hour change, and the market-stats grid stay inside the pane; at wide panes the `Coin data` sidebar (ATH/ATL, supplies, FDV, sentiment, categories, About) renders and the pane upgrades from the row fallback when the rich `/coins/{id}` fetch lands, and falls back cleanly when it fails;

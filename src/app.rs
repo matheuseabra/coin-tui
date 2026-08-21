@@ -173,6 +173,7 @@ pub struct App {
     news_fetching: bool,
     news_generation: u64,
     news_enabled: bool,
+    news_scroll: u16,
     pane_focus: MainPane,
     theme_index: usize,
     schedule: RefreshScheduler,
@@ -419,6 +420,7 @@ impl App {
             news_fetching: false,
             news_generation: 0,
             news_enabled,
+            news_scroll: 0,
             pane_focus: MainPane::Table,
             theme_index: 0,
             schedule: RefreshScheduler::new(tokio::time::Instant::now(), interval),
@@ -500,6 +502,13 @@ impl App {
             }
             Event::Input(key) if input::is_pane_forward(key) || input::is_pane_backward(key) => {
                 self.cycle_pane(input::is_pane_forward(key));
+                Command::Render
+            }
+            Event::Input(key)
+                if self.pane_focus == MainPane::News && input::is_news_scroll(key) =>
+            {
+                self.news_scroll =
+                    input::news_scroll_target(key.code, self.news_scroll, self.viewport_rows);
                 Command::Render
             }
             Event::Input(key) if input::is_detail_open(key) && self.row_count() > 0 => {
@@ -754,6 +763,9 @@ impl App {
             .position(|pane| *pane == self.pane_focus)
             .unwrap_or(0);
         self.pane_focus = PANES[pane::next_index(current, PANES.len(), forward)];
+        if self.pane_focus != MainPane::News {
+            self.news_scroll = 0;
+        }
     }
 
     pub fn state_ref(&self) -> &DataState {
@@ -765,6 +777,9 @@ impl App {
     }
     pub fn fetching(&self) -> bool {
         self.fetching
+    }
+    pub fn news_scroll(&self) -> u16 {
+        self.news_scroll
     }
     pub fn selected(&self) -> usize {
         self.selected

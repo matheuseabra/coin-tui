@@ -108,3 +108,29 @@ pub(crate) fn navigation_target(
 pub(crate) fn table_viewport(height: u16) -> usize {
     height.saturating_sub(7).div_ceil(2).max(1) as usize
 }
+
+pub(crate) fn is_news_scroll(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+        )
+}
+
+pub(crate) fn news_scroll_target(code: KeyCode, current: u16, viewport: usize) -> u16 {
+    let viewport = viewport.max(1) as u16;
+    match code {
+        KeyCode::Up => current.saturating_sub(1),
+        KeyCode::Down => current.saturating_add(1),
+        KeyCode::PageUp => current.saturating_sub(viewport),
+        KeyCode::PageDown => current.saturating_add(viewport),
+        KeyCode::Home => 0,
+        KeyCode::End => u16::MAX,
+        _ => current,
+    }
+}
