@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -255,14 +255,13 @@ fn render_market(
 /// disabled, still loading, failed, or empty.
 fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
     let theme = app.theme();
-    let inner_width = area.width.saturating_sub(2) as usize;
     let projection = view::news(app.news_feed(), app.news_enabled());
     let mut lines = Vec::new();
     for item in &projection.items {
-        lines.push(headline_line(item, inner_width, theme));
+        lines.extend(headline_lines(item, theme));
         if !item.url().is_empty() {
             lines.push(Line::from(Span::styled(
-                clean_remote(item.url(), inner_width),
+                format!("↗ {}", clean_remote(item.url(), 300)),
                 Style::default(),
             )));
         }
@@ -290,33 +289,29 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).block(pane_block("News", focused, theme)),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(pane_block("News", focused, theme)),
         area,
     );
 }
 
-/// One headline: a bounded `source · age` prefix in the summary color followed
-/// by the bounded title, so no remote text can push the line past the pane.
-fn headline_line(item: &NewsItem, width: usize, theme: &Theme) -> Line<'static> {
+/// One headline keeps the title first so the primary information survives a
+/// narrow pane. Source and age follow on a separate metadata line.
+fn headline_lines(item: &NewsItem, theme: &Theme) -> Vec<Line<'static>> {
+    let title = clean_remote(item.title(), 220);
     let source = clean_remote(item.source(), 20);
     let age = item
         .published_at()
         .and_then(|at| (Utc::now() - at).to_std().ok());
-    let prefix = match age {
-        Some(age) => format!("{source} \u{00b7} {}  ", format_age(age)),
-        None => format!("{source}  "),
-    };
-    let title = clean_remote(
-        item.title(),
-        width.saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
-    );
-    truncate_line(
-        Line::from(vec![
-            Span::styled(prefix, Style::default().fg(theme.summary)),
-            Span::styled(title, Style::default()),
-        ]),
-        width,
-    )
+    let age = age.map_or_else(|| "-".to_owned(), format_age);
+    vec![
+        Line::styled(title, Style::default()),
+        Line::styled(
+            format!("  {source} · {age}"),
+            Style::default().fg(theme.summary),
+        ),
+    ]
 }
 
 /// Shared pane frame; the focused pane's title is emphasized.
@@ -330,6 +325,7 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
     };
     Block::default()
         .borders(Borders::ALL)
+        .border_style(style)
         .title(Line::styled(format!(" {title} "), style))
 }
 
@@ -366,7 +362,7 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
             .add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::from(format!(
-        "Up {}   Down {}   Flat {}",
+        "↑ Up {}   ↓ Down {}   • Flat {}",
         projection.up, projection.down, projection.flat
     )));
     let meter_prefix = "Bullish ";
@@ -388,14 +384,14 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
     )));
     if let Some((symbol, value)) = projection.best {
         lines.push(Line::from(format!(
-            "Best: {} {}",
+            "↗ Best: {} {}",
             clean_remote(&symbol, 8),
             format_percentage(Some(value)),
         )));
     }
     if let Some((symbol, value)) = projection.worst {
         lines.push(Line::from(format!(
-            "Worst: {} {}",
+            "↘ Worst: {} {}",
             clean_remote(&symbol, 8),
             format_percentage(Some(value)),
         )));
@@ -715,16 +711,11 @@ fn render_detail_sidebar(
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let width = inner.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (label, value) in detail_stat_rows(state) {
         let label_span = Span::styled(format!("{label}: "), Style::default().fg(theme.summary));
-        let max_value = width.saturating_sub(UnicodeWidthStr::width(label_span.content.as_ref()));
-        let value_span = Span::styled(clean_remote(&value, max_value), Style::default());
-        lines.push(truncate_line(
-            Line::from(vec![label_span, value_span]),
-            width,
-        ));
+        let value_span = Span::styled(clean_remote(&value, 256), Style::default());
+        lines.push(Line::from(vec![label_span, value_span]));
     }
     let status = match state {
         DetailState::Ready { .. } => None,
@@ -744,10 +735,10 @@ fn render_detail_sidebar(
                     .fg(theme.summary)
                     .add_modifier(Modifier::BOLD),
             ));
-            lines.push(Line::styled(clean_remote(about, width), Style::default()));
+            lines.push(Line::styled(clean_remote(about, 512), Style::default()));
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// CoinMarketCap-style stat rows. The rich state uses every extended field;
@@ -3900,11 +3891,14 @@ mod tests {
         )));
         let rendered = text_at(&app, 60, 16);
         assert!(rendered.contains(" Sentiment "), "{rendered:?}");
-        assert!(rendered.contains("Up 2   Down 1   Flat 1"), "{rendered:?}");
+        assert!(
+            rendered.contains("↑ Up 2   ↓ Down 1   • Flat 1"),
+            "{rendered:?}"
+        );
         assert!(rendered.contains("Bullish"), "{rendered:?}");
         assert!(rendered.contains("50%"), "2 of 4 are up: {rendered:?}");
-        assert!(rendered.contains("Best: AA +3.00%"), "{rendered:?}");
-        assert!(rendered.contains("Worst: BB -1.00%"), "{rendered:?}");
+        assert!(rendered.contains("↗ Best: AA +3.00%"), "{rendered:?}");
+        assert!(rendered.contains("↘ Worst: BB -1.00%"), "{rendered:?}");
         assert!(rendered.contains("Avg 24h:"), "{rendered:?}");
     }
 
@@ -4056,7 +4050,8 @@ mod tests {
         assert!(rendered.contains("layer-1"), "{rendered:?}");
         assert!(rendered.contains("Total supply: 21.0M"), "{rendered:?}");
         assert!(
-            rendered.contains("A peer-to-peer network for the fixt"),
+            rendered.contains("A peer-to-peer network for the")
+                && rendered.contains("fixture test."),
             "the About snippet renders (bounded to the sidebar width): {rendered:?}"
         );
 

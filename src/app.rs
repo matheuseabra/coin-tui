@@ -3314,7 +3314,7 @@ mod tests {
         );
         let rendered = render_text(&app);
         assert!(
-            rendered.contains("ATH: $100K") && rendered.contains("About: A peer-to-peer network"),
+            rendered.contains("ATH: $100K") && rendered.contains("Categories: layer-1"),
             "the rich detail fields render: {rendered:?}"
         );
 
