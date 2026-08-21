@@ -27,11 +27,17 @@ pub(crate) fn is_detail_open(key: KeyEvent) -> bool {
 }
 
 pub(crate) fn is_pane_forward(key: KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press && key.code == KeyCode::Tab && key.modifiers.is_empty()
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Tab
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 pub(crate) fn is_pane_backward(key: KeyEvent) -> bool {
-    key.kind == KeyEventKind::Press && key.code == KeyCode::BackTab
+    key.kind == KeyEventKind::Press
+        && (key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT)))
 }
 
 pub(crate) fn is_sort_forward(key: KeyEvent) -> bool {

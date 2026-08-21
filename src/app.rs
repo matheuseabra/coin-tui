@@ -3556,6 +3556,9 @@ mod tests {
             MainPane::Sentiment,
             "Shift-Tab wraps back"
         );
+        let shift_tab_as_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert!(is_render(app.update(Event::Input(shift_tab_as_tab))));
+        assert_eq!(app.pane_focus(), MainPane::News);
 
         // Tab is swallowed while searching, help is open, or detail is open.
         let mut searching = loaded_app(mixed_snapshot(vec![coin_row("a", 1, "A", "A")]));

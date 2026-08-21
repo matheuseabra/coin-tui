@@ -219,7 +219,7 @@ fn render_market(
 ) {
     if width < PANE_MIN_WIDTH {
         match app.pane_focus() {
-            MainPane::Table => table_frame(title, app, info, frame, area, width),
+            MainPane::Table => table_frame(title, app, info, frame, area, width, true),
             MainPane::News => news_pane(app, frame, area, true),
             MainPane::Sentiment => sentiment_pane(app, frame, area, true),
         }
@@ -229,7 +229,15 @@ fn render_market(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .areas(area);
-    table_frame(title, app, info, frame, table_area, table_area.width);
+    table_frame(
+        title,
+        app,
+        info,
+        frame,
+        table_area,
+        table_area.width,
+        app.pane_focus() == MainPane::Table,
+    );
     let [news_area, sentiment_area] = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -428,12 +436,10 @@ fn table_frame(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     width: u16,
+    focused: bool,
 ) {
     let theme = app.theme();
-    let block = Block::default().borders(Borders::ALL).title(Line::styled(
-        format!(" {title} "),
-        Style::default().fg(theme.summary),
-    ));
+    let block = pane_block(title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let table_area = if info.is_empty() {

@@ -13,7 +13,7 @@ pub const DEFAULT_REFRESH_SECONDS: u64 = 60;
 pub const MIN_REFRESH_SECONDS: u64 = 15;
 
 /// Default news feed: the CoinDesk crypto headline RSS, keyless and HTTPS.
-pub const DEFAULT_NEWS_URL: &str = "https://www.coindesk.com/arc/outboundfeeds/rss/";
+pub const DEFAULT_NEWS_URL: &str = "https://www.coindesk.com/arc/outboundfeeds/rss";
 
 /// Typed CLI surface. Flags documented by clap derive; env alternatives are
 /// listed on the same flag so `--help` is complete.
