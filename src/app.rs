@@ -20,6 +20,7 @@ use crate::{
     domain::{CoinDetail, CoinMarket, MarketSnapshot, PricePoint},
     log::FileLog,
     news::{NewsItem, NewsProvider, RssNewsClient},
+    sentiment::{AlternativeMeClient, FearGreedIndex, FearGreedProvider},
     theme::{Theme, THEMES},
     tui, ui,
 };
@@ -49,6 +50,9 @@ pub enum Event {
     NewsResult {
         generation: u64,
         result: Result<Vec<NewsItem>, ApiError>,
+    },
+    FearGreedResult {
+        result: Result<FearGreedIndex, ApiError>,
     },
 }
 
@@ -155,6 +159,40 @@ pub enum MainPane {
     Sentiment,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChartRange {
+    Day,
+    #[default]
+    Week,
+    Month,
+}
+
+impl ChartRange {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Day => "1 day",
+            Self::Week => "7 days",
+            Self::Month => "30 days",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Day => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::Day,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Day => Self::Month,
+            Self::Week => Self::Day,
+            Self::Month => Self::Week,
+        }
+    }
+}
+
 pub struct App {
     state: DataState,
     generation: u64,
@@ -169,7 +207,9 @@ pub struct App {
     chart_fetching: bool,
     detail_generation: u64,
     detail_id: Option<String>,
+    detail_range: ChartRange,
     news: Option<NewsFeed>,
+    fear_greed: Option<FearGreedIndex>,
     news_fetching: bool,
     news_generation: u64,
     news_enabled: bool,
@@ -416,7 +456,9 @@ impl App {
             chart_fetching: false,
             detail_generation: 0,
             detail_id: None,
+            detail_range: ChartRange::default(),
             news: None,
+            fear_greed: None,
             news_fetching: false,
             news_generation: 0,
             news_enabled,
@@ -460,6 +502,12 @@ impl App {
                     self.request_refresh()
                 } else if input::is_theme_forward(key) || input::is_theme_backward(key) {
                     self.cycle_theme(input::is_theme_forward(key));
+                    Command::Render
+                } else if input::is_chart_range_next(key) {
+                    self.detail_range = self.detail_range.next();
+                    Command::Render
+                } else if input::is_chart_range_previous(key) {
+                    self.detail_range = self.detail_range.previous();
                     Command::Render
                 } else {
                     Command::None
@@ -521,6 +569,7 @@ impl App {
                         base: coin.clone(),
                         chart_30d: Vec::new(),
                     });
+                    self.detail_range = ChartRange::default();
                     self.begin_detail_fetch(coin.id())
                 } else {
                     Command::None
@@ -687,6 +736,12 @@ impl App {
                 });
                 Command::Render
             }
+            Event::FearGreedResult { result } => {
+                if let Ok(index) = result {
+                    self.fear_greed = Some(index);
+                }
+                Command::Render
+            }
             Event::Input(_) => Command::None,
         }
     }
@@ -780,6 +835,12 @@ impl App {
     }
     pub fn news_scroll(&self) -> u16 {
         self.news_scroll
+    }
+    pub fn detail_range(&self) -> ChartRange {
+        self.detail_range
+    }
+    pub fn fear_greed(&self) -> Option<&FearGreedIndex> {
+        self.fear_greed.as_ref()
     }
     pub fn selected(&self) -> usize {
         self.selected
@@ -976,6 +1037,7 @@ fn clamped_index(index: usize, count: usize) -> usize {
 pub struct Controller<P: MarketData + ?Sized> {
     provider: Arc<P>,
     news: Arc<dyn NewsProvider>,
+    fear_greed: Option<Arc<dyn FearGreedProvider>>,
     events: mpsc::Sender<Event>,
     results: mpsc::Receiver<Event>,
     cancellation: CancellationToken,
@@ -1002,7 +1064,14 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
 
     #[cfg(test)]
     pub fn with_interval(provider: Arc<P>, tracer: Option<FileLog>, interval: Duration) -> Self {
-        Self::with_news_and_flag(provider, Arc::new(NoNewsProvider), tracer, interval, false)
+        Self::with_news_and_flag(
+            provider,
+            Arc::new(NoNewsProvider),
+            tracer,
+            interval,
+            false,
+            None,
+        )
     }
 
     /// Controller with a real news feed; the app enables news fetches.
@@ -1012,7 +1081,17 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         tracer: Option<FileLog>,
         interval: Duration,
     ) -> Self {
-        Self::with_news_and_flag(provider, news, tracer, interval, true)
+        Self::with_news_and_flag(provider, news, tracer, interval, true, None)
+    }
+
+    pub fn with_news_and_sentiment(
+        provider: Arc<P>,
+        news: Arc<dyn NewsProvider>,
+        fear_greed: Arc<dyn FearGreedProvider>,
+        tracer: Option<FileLog>,
+        interval: Duration,
+    ) -> Self {
+        Self::with_news_and_flag(provider, news, tracer, interval, true, Some(fear_greed))
     }
 
     fn with_news_and_flag(
@@ -1021,11 +1100,13 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
         tracer: Option<FileLog>,
         interval: Duration,
         news_enabled: bool,
+        fear_greed: Option<Arc<dyn FearGreedProvider>>,
     ) -> Self {
         let (events, results) = mpsc::channel(16);
         Self {
             provider,
             news,
+            fear_greed,
             events,
             results,
             cancellation: CancellationToken::new(),
@@ -1097,6 +1178,11 @@ impl<P: MarketData + ?Sized + 'static> Controller<P> {
                     generation: news_generation,
                     result,
                 }
+            });
+        }
+        if let Some(provider) = self.fear_greed.as_ref().map(Arc::clone) {
+            self.spawn_operation(async move { provider.fetch().await }, |result| {
+                Event::FearGreedResult { result }
             });
         }
     }
@@ -1206,12 +1292,15 @@ pub async fn run(config: Config) -> io::Result<()> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let news = RssNewsClient::new(&config.news_url)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let fear_greed = AlternativeMeClient::new()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
     let tracer = open_log(&config, api_key)?;
     let mut session = tui::enter()?;
     let result = run_loop(
         session.terminal_mut(),
         Arc::new(provider),
         Arc::new(news),
+        Arc::new(fear_greed),
         tracer,
         config.refresh_seconds,
     )
@@ -1237,6 +1326,7 @@ async fn run_loop<P: MarketData + 'static>(
     terminal: &mut tui::AppTerminal,
     provider: Arc<P>,
     news: Arc<dyn NewsProvider>,
+    fear_greed: Arc<dyn FearGreedProvider>,
     tracer: Option<FileLog>,
     refresh_seconds: u64,
 ) -> io::Result<()> {
@@ -1244,6 +1334,7 @@ async fn run_loop<P: MarketData + 'static>(
     run_loop_with_sources_and_tracer(
         provider,
         news,
+        Some(fear_greed),
         EventStream::new(),
         &mut draw,
         tracer,
@@ -1264,6 +1355,7 @@ where
     run_loop_with_sources_and_tracer(
         provider,
         Arc::new(NoNewsProvider),
+        None,
         input,
         render,
         None,
@@ -1275,6 +1367,7 @@ where
 async fn run_loop_with_sources_and_tracer<P, S, R>(
     provider: Arc<P>,
     news: Arc<dyn NewsProvider>,
+    fear_greed: Option<Arc<dyn FearGreedProvider>>,
     mut input: S,
     mut render: R,
     tracer: Option<FileLog>,
@@ -1285,7 +1378,16 @@ where
     S: Stream<Item = Result<CrosstermEvent, io::Error>> + Unpin,
     R: FnMut(&App) -> io::Result<()>,
 {
-    let mut controller = Controller::with_news(provider, news, tracer, refresh_interval);
+    let mut controller = match fear_greed {
+        Some(fear_greed) => Controller::with_news_and_sentiment(
+            provider,
+            news,
+            fear_greed,
+            tracer,
+            refresh_interval,
+        ),
+        None => Controller::with_news(provider, news, tracer, refresh_interval),
+    };
     let session_log = controller.tracer.clone();
     let render_tracer = session_log.clone();
     let loop_result = async {
@@ -2322,6 +2424,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
             Arc::new(NoNewsProvider),
+            None,
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -2421,6 +2524,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
             }),
             Arc::new(NoNewsProvider),
+            None,
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -2455,6 +2559,7 @@ mod tests {
         let result = run_loop_with_sources_and_tracer(
             Arc::new(FailingProvider),
             Arc::new(NoNewsProvider),
+            None,
             eof_after(Duration::from_millis(50)),
             |_| Ok(()),
             tracer,
@@ -3203,6 +3308,11 @@ mod tests {
         ]));
         enter(&mut app);
         assert!(app.detail_open());
+        assert_eq!(app.detail_range(), ChartRange::Week);
+        assert!(is_render(app.update(Event::Input(key(']')))));
+        assert_eq!(app.detail_range(), ChartRange::Month);
+        assert!(is_render(app.update(Event::Input(key('[')))));
+        assert_eq!(app.detail_range(), ChartRange::Week);
         let selected = app.selected();
         for route in ['j', 'k', 'g', 'G', 's', 'S', '/'] {
             assert!(

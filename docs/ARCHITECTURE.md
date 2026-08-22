@@ -64,7 +64,7 @@ On top of the row-backed base, `Enter` starts an on-demand `GET /coins/{id}` fet
 
 #### News And Pane Layout
 
-`Tab`/`Shift-Tab` cycle `MainPane` (`Table`, `News`, `Sentiment`). Below `PANE_MIN_WIDTH = 162` the focused pane renders alone in the body so the table keeps its full column set; at 162+ the body splits horizontally 70/30 (table 70%, a right column 30%) and the right column splits vertically into two equal rows holding the news pane (top) and the sentiment pane (bottom), with focus emphasizing the active pane's border and title. `App.news_scroll` owns the news offset; directional, page, home, and end keys change it only while News is focused, and the renderer clamps it to wrapped content. Pane keys are swallowed while searching, while help is open, or on the detail screen.
+`Tab`/`Shift-Tab` cycle `MainPane` (`Table`, `News`, `Sentiment`). Below `PANE_MIN_WIDTH = 162` the focused pane renders alone in the body so the table keeps its full column set; at 162+ the body splits horizontally 70/30 (table 70%, a right column 30%) and the right column splits vertically into two equal rows holding the news pane (top) and the sentiment pane (bottom), with focus emphasizing the active pane's border and title. `App.news_scroll` owns the news offset; directional, page, home, and end keys change it only while News is focused, and the renderer clamps it to wrapped content. The optional `FearGreedProvider` fetches Alternative.me's bounded JSON payload alongside a refresh and preserves the last index when the request fails. Pane keys are swallowed while searching, while help is open, or on the detail screen.
 
 The news feed is a separate `NewsProvider` boundary (`src/news.rs`): `RssNewsClient` fetches the configured RSS URL with the same URL validation, no-redirect client, bounded 1 MiB body, and timeout rules as the market provider, and `parse_rss` normalizes items into bounded `NewsItem` values (title ≤ 220 scalars, source ≤ 28, url ≤ 300, control characters stripped, RFC-2822 dates parsed to UTC). An HTML error page cannot masquerade as an empty feed: a missing `<rss>`/`<feed>` root is `MalformedResponse`. The news fetch is chained onto a market refresh (`Command::Fetch { news_generation }`), one in flight at a time, generation-guarded like the market fetch, and spawned as its own cancellable task so a slow feed never blocks input, the market refresh, or shutdown. A failed news refresh preserves the last headlines and records the notice; the `NewsFeed` state is the newest items plus an optional `ApiError`.
 
@@ -91,6 +91,7 @@ src/
 |-- detail.rs        # detail generation transitions
 |-- pane.rs          # pane-focus transitions
 |-- news.rs          # NewsProvider trait, RSS client and bounded parsing
+|-- sentiment.rs     # optional Alternative.me Fear & Greed provider
 |-- format.rs        # deterministic money, percentage and supply formatting
 |-- log.rs           # redacted file tracing
 |-- theme.rs         # built-in color themes as semantic roles

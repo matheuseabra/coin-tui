@@ -10,6 +10,7 @@ mod log;
 mod news;
 mod pane;
 mod refresh;
+mod sentiment;
 mod theme;
 mod tui;
 mod ui;

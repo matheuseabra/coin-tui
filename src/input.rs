@@ -134,3 +134,11 @@ pub(crate) fn news_scroll_target(code: KeyCode, current: u16, viewport: usize) -
         _ => current,
     }
 }
+
+pub(crate) fn is_chart_range_next(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char(']')
+}
+
+pub(crate) fn is_chart_range_previous(key: KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press && key.code == KeyCode::Char('[')
+}

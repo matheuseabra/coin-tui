@@ -23,6 +23,7 @@ const MAX_FEED_BYTES: usize = 1024 * 1024;
 const MAX_NEWS_ITEMS: usize = 15;
 const MAX_TITLE_CHARS: usize = 220;
 const MAX_SOURCE_CHARS: usize = 28;
+const MAX_CATEGORY_CHARS: usize = 32;
 const MAX_URL_CHARS: usize = 300;
 
 /// One normalized headline. All text is provider-blob and is sanitized and
@@ -31,6 +32,7 @@ const MAX_URL_CHARS: usize = 300;
 pub struct NewsItem {
     title: String,
     source: String,
+    category: String,
     url: String,
     published_at: Option<DateTime<Utc>>,
 }
@@ -43,6 +45,7 @@ impl NewsItem {
         Self {
             title: title.to_owned(),
             source: source.to_owned(),
+            category: source.to_owned(),
             url: url.to_owned(),
             published_at: None,
         }
@@ -51,11 +54,16 @@ impl NewsItem {
     pub fn title(&self) -> &str {
         &self.title
     }
+    #[allow(dead_code)]
     pub fn source(&self) -> &str {
         &self.source
     }
+    #[allow(dead_code)]
     pub fn url(&self) -> &str {
         &self.url
+    }
+    pub fn category(&self) -> &str {
+        &self.category
     }
     pub fn published_at(&self) -> Option<DateTime<Utc>> {
         self.published_at
@@ -141,6 +149,7 @@ fn parse_rss(body: &[u8]) -> (Vec<NewsItem>, bool) {
     let mut title = String::new();
     let mut link = String::new();
     let mut pub_date = String::new();
+    let mut category = String::new();
     let mut buffer = Vec::new();
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -154,6 +163,7 @@ fn parse_rss(body: &[u8]) -> (Vec<NewsItem>, bool) {
                         title.clear();
                         link.clear();
                         pub_date.clear();
+                        category.clear();
                     }
                     _ => {}
                 }
@@ -163,7 +173,14 @@ fn parse_rss(body: &[u8]) -> (Vec<NewsItem>, bool) {
                 if let Ok(value) = text.unescape() {
                     let value = value.into_owned();
                     if in_item {
-                        append_item_field(&element, &value, &mut title, &mut link, &mut pub_date);
+                        append_item_field(
+                            &element,
+                            &value,
+                            &mut title,
+                            &mut link,
+                            &mut pub_date,
+                            &mut category,
+                        );
                     } else if element == b"title" && channel_title.is_empty() {
                         channel_title = trim_control(&value);
                     }
@@ -172,7 +189,14 @@ fn parse_rss(body: &[u8]) -> (Vec<NewsItem>, bool) {
             Ok(Event::CData(cdata)) => {
                 let value = String::from_utf8_lossy(&cdata.into_inner()).into_owned();
                 if in_item {
-                    append_item_field(&element, &value, &mut title, &mut link, &mut pub_date);
+                    append_item_field(
+                        &element,
+                        &value,
+                        &mut title,
+                        &mut link,
+                        &mut pub_date,
+                        &mut category,
+                    );
                 } else if element == b"title" && channel_title.is_empty() {
                     channel_title = trim_control(&value);
                 }
@@ -184,6 +208,14 @@ fn parse_rss(body: &[u8]) -> (Vec<NewsItem>, bool) {
                     items.push(NewsItem {
                         title: bound_text(&title, MAX_TITLE_CHARS),
                         source: bound_text(&channel_title, MAX_SOURCE_CHARS),
+                        category: bound_text(
+                            if category.is_empty() {
+                                &channel_title
+                            } else {
+                                &category
+                            },
+                            MAX_CATEGORY_CHARS,
+                        ),
                         url: bound_text(&link, MAX_URL_CHARS),
                         published_at: parse_rfc2822(&pub_date),
                     });
@@ -208,11 +240,13 @@ fn append_item_field(
     title: &mut String,
     link: &mut String,
     pub_date: &mut String,
+    category: &mut String,
 ) {
     match element {
         b"title" if title.is_empty() => *title = value.to_owned(),
         b"link" if link.is_empty() => *link = value.to_owned(),
         b"pubDate" if pub_date.is_empty() => *pub_date = value.to_owned(),
+        b"category" if category.is_empty() => *category = value.to_owned(),
         _ => {}
     }
 }
@@ -246,6 +280,7 @@ mod tests {
     <title>Test Wire</title>
     <item>
       <title><![CDATA[Bitcoin rises ]]></title>
+      <category>Markets</category>
       <link>https://example.com/stories/bitcoin-rises</link>
       <pubDate>Tue, 18 Aug 2026 14:41:31 +0000</pubDate>
     </item>
@@ -265,6 +300,7 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].title(), "Bitcoin rises ");
         assert_eq!(items[0].source(), "Test Wire");
+        assert_eq!(items[0].category(), "Markets");
         assert_eq!(items[0].url(), "https://example.com/stories/bitcoin-rises");
         assert!(items[0].published_at().is_some());
         assert_eq!(items[1].title(), "Ethereum falls & settles");

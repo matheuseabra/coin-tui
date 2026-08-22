@@ -12,8 +12,8 @@ const MAX_SANITIZED_SCALARS: usize = 256;
 
 use crate::{
     api::ApiError,
-    app::{App, DataState, DetailState, MainPane},
-    domain::{daily_candles, CoinMarket},
+    app::{App, ChartRange, DataState, DetailState, MainPane},
+    domain::{daily_candles, CoinMarket, PricePoint},
     format::{
         format_age, format_compact_money, format_compact_supply, format_percentage, format_price,
     },
@@ -260,12 +260,6 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
     let mut lines = Vec::new();
     for item in &projection.items {
         lines.extend(headline_lines(item, theme));
-        if !item.url().is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("↗ {}", clean_remote(item.url(), 300)),
-                Style::default(),
-            )));
-        }
     }
     if projection.items.is_empty() {
         lines.push(Line::styled(
@@ -303,10 +297,10 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
 }
 
 /// One headline keeps the title first so the primary information survives a
-/// narrow pane. Source and age follow on a separate metadata line.
+/// narrow pane. Time and category follow on a separate metadata line.
 fn headline_lines(item: &NewsItem, theme: &Theme) -> Vec<Line<'static>> {
     let title = clean_remote(item.title(), 220);
-    let source = clean_remote(item.source(), 20);
+    let category = clean_remote(item.category(), 32);
     let age = item
         .published_at()
         .and_then(|at| (Utc::now() - at).to_std().ok());
@@ -314,7 +308,7 @@ fn headline_lines(item: &NewsItem, theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::styled(title, Style::default()),
         Line::styled(
-            format!("  {source} · {age}"),
+            format!("  · {age} · {category}"),
             Style::default().fg(theme.summary),
         ),
     ]
@@ -388,6 +382,12 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
         "Avg 24h: {}",
         format_percentage(Some(projection.average))
     )));
+    if let Some(index) = app.fear_greed() {
+        lines.push(Line::from(format!(
+            "Fear & Greed: {} ({})",
+            index.value, index.classification
+        )));
+    }
     if let Some((symbol, value)) = projection.best {
         lines.push(Line::from(format!(
             "↗ Best: {} {}",
@@ -490,10 +490,10 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
             .areas(inner);
-        render_detail_main(frame, state, main, theme, true);
+        render_detail_main(frame, state, main, theme, true, app.detail_range());
         render_detail_sidebar(frame, app, state, sidebar, theme);
     } else {
-        render_detail_main(frame, state, inner, theme, false);
+        render_detail_main(frame, state, inner, theme, false, app.detail_range());
     }
 }
 
@@ -503,6 +503,7 @@ fn render_detail_main(
     area: ratatui::layout::Rect,
     theme: &Theme,
     sidebar: bool,
+    range: ChartRange,
 ) {
     let coin = state.base();
     let content_width = if sidebar {
@@ -556,7 +557,7 @@ fn render_detail_main(
         Paragraph::new(truncate_line(change_line(coin, theme), column_width)),
         changes,
     );
-    render_detail_chart(frame, state, chart, theme);
+    render_detail_chart(frame, state, chart, theme, range);
     if !sidebar && stats.height >= 1 {
         render_compact_detail_stats(frame, state, stats, column_width, theme);
     }
@@ -567,8 +568,9 @@ fn render_detail_chart(
     state: &DetailState,
     area: ratatui::layout::Rect,
     theme: &Theme,
+    range: ChartRange,
 ) {
-    let Some(candles) = detail_candles(state) else {
+    let Some(candles) = detail_candles(state, range) else {
         frame.render_widget(Paragraph::new("No price data available."), area);
         return;
     };
@@ -586,15 +588,11 @@ fn render_detail_chart(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .areas(area);
     frame.render_widget(chart, chart_area);
-    let period = if state.chart_30d().is_empty() {
-        "7 days"
-    } else {
-        "30 days"
-    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(
-                "{period}: {} → {}",
+                "{}: {} → {}",
+                range.label(),
                 format_price(Some(candles.low)),
                 format_price(Some(candles.high))
             ),
@@ -607,9 +605,25 @@ fn render_detail_chart(
 /// The candles for the detail chart plus the plotted price range, derived as
 /// daily OHLC from the rich hourly series when present, else from the
 /// row-derived 7-day series. `None` when there is no finite series to plot.
-fn detail_candles(state: &DetailState) -> Option<DetailCandles> {
+fn detail_candles(state: &DetailState, range: ChartRange) -> Option<DetailCandles> {
     let projection = view::detail(state)?;
-    let bars = daily_candles(&projection.series)
+    let latest = projection
+        .series
+        .iter()
+        .map(|point| point.timestamp)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let range_ms = match range {
+        ChartRange::Day => 86_400_000.0,
+        ChartRange::Week => 7.0 * 86_400_000.0,
+        ChartRange::Month => 30.0 * 86_400_000.0,
+    };
+    let start = latest - range_ms;
+    let series: Vec<PricePoint> = projection
+        .series
+        .into_iter()
+        .filter(|point| point.timestamp >= start)
+        .collect();
+    let bars = daily_candles(&series)
         .into_iter()
         .map(|candle| chandelier::Candle::new(candle.open, candle.high, candle.low, candle.close))
         .collect();
@@ -2341,7 +2355,7 @@ mod tests {
             (0..168).map(|hour| hour as f64).collect(),
         )]);
         let state = app.detail_state().expect("detail is open");
-        let candles = detail_candles(state).expect("finite series plots");
+        let candles = detail_candles(state, ChartRange::Week).expect("finite series plots");
         assert_eq!(candles.bars.len(), 7, "one candle per day");
         assert_eq!(candles.low, 0.0);
         assert_eq!(candles.high, 167.0);
@@ -2356,11 +2370,11 @@ mod tests {
             0.0,
             vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
         )]);
-        assert!(detail_candles(hostile.detail_state().unwrap()).is_none());
+        assert!(detail_candles(hostile.detail_state().unwrap(), ChartRange::Week).is_none());
 
         // An empty series has nothing to plot.
         let empty = detail_app(vec![detail_row("Bitcoin", "BTC", 1.0, 0.0, vec![])]);
-        assert!(detail_candles(empty.detail_state().unwrap()).is_none());
+        assert!(detail_candles(empty.detail_state().unwrap(), ChartRange::Week).is_none());
     }
 
     #[test]
@@ -3814,9 +3828,10 @@ mod tests {
             rendered.contains("Headline 0 about markets"),
             "{rendered:?}"
         );
+        assert!(rendered.contains("· - · Fixture Wire"), "{rendered:?}");
         assert!(
-            rendered.contains("https://example.com/stories/0"),
-            "the headline URL renders: {rendered:?}"
+            !rendered.contains("https://example.com/stories/0"),
+            "{rendered:?}"
         );
 
         // A failed refresh keeps the headlines and appends the notice.
@@ -3861,7 +3876,7 @@ mod tests {
         )));
         let later = text_at(&app, 60, 16);
         assert!(app.news_scroll() > 0);
-        assert!(later.contains("Headline 6 about markets"), "{later:?}");
+        assert!(later.contains("Headline 8 about markets"), "{later:?}");
     }
 
     #[test]
@@ -3917,6 +3932,12 @@ mod tests {
             snapshot: rows_snapshot(snapshot_rows),
             summary_notice: None,
         }));
+        app.update(Event::FearGreedResult {
+            result: Ok(crate::sentiment::FearGreedIndex {
+                value: 72,
+                classification: "Greed".into(),
+            }),
+        });
         // Two Tabs: Table -> News -> Sentiment.
         app.update(Event::Input(KeyEvent::new(
             KeyCode::Tab,
@@ -3937,6 +3958,10 @@ mod tests {
         assert!(rendered.contains("↗ Best: AA +3.00%"), "{rendered:?}");
         assert!(rendered.contains("↘ Worst: BB -1.00%"), "{rendered:?}");
         assert!(rendered.contains("Avg 24h:"), "{rendered:?}");
+        assert!(
+            rendered.contains("Fear & Greed: 72 (Greed)"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
