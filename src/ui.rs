@@ -483,7 +483,7 @@ fn table_frame(
 /// Read-only coin detail pane in a CoinMarketCap shape: a scaled-down content
 /// column holds the identity header (rank, name, symbol), the price with its
 /// 24-hour change, the 1h/24h/7d change strip, and a fixed-geometry gradient
-/// area chart with real price labels. Wide panes add a right-hand "coin data"
+/// area chart with real price labels. Wide panes add a left-hand "coin data"
 /// column fixed at 150 terminal cells, fed by the rich `/coins/{id}` detail
 /// when it has loaded; narrow
 /// panes stack a two-line market-stats grid under the chart instead. It always
@@ -505,12 +505,12 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
         return;
     }
     if inner.width > DETAIL_SIDEBAR_WIDTH {
-        let [main, sidebar] = Layout::default()
+        let [sidebar, main] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(DETAIL_SIDEBAR_WIDTH)])
             .areas(inner);
-        render_detail_main(frame, state, main, theme, true, app.detail_range());
         render_detail_sidebar(frame, app, state, sidebar, theme);
+        render_detail_main(frame, state, main, theme, true, app.detail_range());
     } else {
         render_detail_main(frame, state, inner, theme, false, app.detail_range());
     }
