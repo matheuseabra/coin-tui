@@ -34,9 +34,9 @@ const MIN_HEIGHT: u16 = 16;
 /// the panes are side-by-side.
 const PANE_MIN_WIDTH: u16 = 162;
 
-/// Detail sidebar (coin data) appears beside the chart when the pane is at
-/// least this wide; below it the stats render as stacked lines under chart.
-const DETAIL_SIDEBAR_MIN_WIDTH: u16 = 78;
+/// Fixed detail sidebar width in terminal cells. The two-column layout is used
+/// only when the chart keeps at least one cell beside this rail.
+const DETAIL_SIDEBAR_WIDTH: u16 = 150;
 
 /// Help overlay width and content. Every line must fit the inner width (width
 /// minus borders) and the whole block must fit the minimum supported height.
@@ -483,9 +483,9 @@ fn table_frame(
 /// Read-only coin detail pane in a CoinMarketCap shape: a scaled-down content
 /// column holds the identity header (rank, name, symbol), the price with its
 /// 24-hour change, the 1h/24h/7d change strip, and a fixed-geometry gradient
-/// area chart with real price labels. Wide panes add a left-hand "coin data"
-/// column at exactly 30% of the available width, fed by the rich `/coins/{id}`
-/// detail when it has loaded; narrow
+/// area chart with real price labels. Wide panes add a right-hand "coin data"
+/// column fixed at 150 terminal cells, fed by the rich `/coins/{id}` detail
+/// when it has loaded; narrow
 /// panes stack a two-line market-stats grid under the chart instead. It always
 /// renders from the snapshot row's own normalized series as a fallback, so it
 /// works offline against the fixture server.
@@ -504,14 +504,13 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    if inner.width >= DETAIL_SIDEBAR_MIN_WIDTH {
-        let sidebar_width = (inner.width * 30 / 100).max(1);
-        let [sidebar, main] = Layout::default()
+    if inner.width > DETAIL_SIDEBAR_WIDTH {
+        let [main, sidebar] = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
+            .constraints([Constraint::Min(1), Constraint::Length(DETAIL_SIDEBAR_WIDTH)])
             .areas(inner);
-        render_detail_sidebar(frame, app, state, sidebar, theme);
         render_detail_main(frame, state, main, theme, true, app.detail_range());
+        render_detail_sidebar(frame, app, state, sidebar, theme);
     } else {
         render_detail_main(frame, state, inner, theme, false, app.detail_range());
     }
@@ -4118,7 +4117,7 @@ mod tests {
             result: Ok(Box::new(detail)),
         });
 
-        let rendered = text_at(&app, 120, 30);
+        let rendered = text_at(&app, 200, 30);
         assert!(rendered.contains(" Coin data "), "{rendered:?}");
         assert!(rendered.contains("ATH: $100K (-50.00%)"), "{rendered:?}");
         assert!(rendered.contains("FDV: $1.1T"), "{rendered:?}");
@@ -4142,7 +4141,7 @@ mod tests {
             -2.0,
             vec![1.0, 2.0],
         )]);
-        let rendered = text_at(&basic, 120, 30);
+        let rendered = text_at(&basic, 200, 30);
         assert!(
             rendered.contains("Loading extended data..."),
             "{rendered:?}"

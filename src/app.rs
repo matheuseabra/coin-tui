@@ -1621,7 +1621,11 @@ mod tests {
     }
 
     fn render_text(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        render_text_at(app, 80, 24)
+    }
+
+    fn render_text_at(app: &App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| crate::ui::render(frame, app))
             .unwrap();
@@ -3439,7 +3443,7 @@ mod tests {
             ),
             "a completed detail fetch upgrades the pane to Ready"
         );
-        let rendered = render_text(&app);
+        let rendered = render_text_at(&app, 200, 30);
         assert!(
             rendered.contains("ATH: $100K") && rendered.contains("Categories: layer-1"),
             "the rich detail fields render: {rendered:?}"

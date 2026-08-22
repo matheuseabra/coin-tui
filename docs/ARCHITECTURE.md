@@ -54,7 +54,7 @@ Refreshing a ready, empty, or stale state keeps the snapshot visible and sets `f
 
 ### Coin Detail Screen
 
-Wide detail panes use an exact 30%/70% split: the left `Coin data` sidebar receives 30% of the inner width and the chart/main area receives the remaining 70%. The two-column split remains gated by `DETAIL_SIDEBAR_MIN_WIDTH`; narrower panes use the stacked layout.
+Wide detail panes use a fixed 150-cell right `Coin data` sidebar; the chart/main area receives the remaining width. The two-column split is used only when at least one cell remains for the chart, otherwise panes use the stacked layout.
 
 `Enter` on a selected row stores a clone of the selected `CoinMarket` in `App.detail` as `DetailState::Basic`; `Esc` clears it. Opening and closing never touch `selected`, so the table's selection and viewport are preserved across the transition. While `detail` is set the input update is modal: navigation, search, and sort keys fall through to `Command::None`, while `r`, `?`, `q`, and `Esc` remain active. A successful refresh replaces the stored coin's base row with the matching-ID row from the new snapshot, so the pane stays fresh without holding a second query to the provider.
 

@@ -41,6 +41,8 @@ The first release excludes:
 
 ## Product Surface
 
+The current wide coin detail layout places the `Coin data` sidebar on the right at a fixed 150 terminal-cell width. The chart and main content use the remaining space; narrow terminals keep the stacked layout.
+
 ```text
 + Market cap -----+ 24h volume -----+ BTC dominance --+ Updated / status -+
 +-------------------------------------------------------------------------+
