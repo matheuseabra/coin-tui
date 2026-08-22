@@ -36,7 +36,7 @@ const PANE_MIN_WIDTH: u16 = 162;
 
 /// Fixed detail sidebar width in terminal cells. The two-column layout is used
 /// only when the chart keeps at least one cell beside this rail.
-const DETAIL_SIDEBAR_WIDTH: u16 = 150;
+const DETAIL_SIDEBAR_WIDTH: u16 = 220;
 
 /// Help overlay width and content. Every line must fit the inner width (width
 /// minus borders) and the whole block must fit the minimum supported height.
@@ -484,7 +484,7 @@ fn table_frame(
 /// column holds the identity header (rank, name, symbol), the price with its
 /// 24-hour change, the 1h/24h/7d change strip, and a fixed-geometry gradient
 /// area chart with real price labels. Wide panes add a left-hand "coin data"
-/// column fixed at 150 terminal cells, fed by the rich `/coins/{id}` detail
+/// column fixed at 220 terminal cells, fed by the rich `/coins/{id}` detail
 /// when it has loaded; narrow
 /// panes stack a two-line market-stats grid under the chart instead. It always
 /// renders from the snapshot row's own normalized series as a fallback, so it
@@ -4032,7 +4032,7 @@ mod tests {
             "{rendered:?}"
         );
 
-        let rendered = text_at(&app, 200, 30);
+        let rendered = text_at(&app, 280, 30);
         assert!(rendered.contains("News"), "{rendered:?}");
         assert!(rendered.contains("Sentiment"), "{rendered:?}");
         assert!(rendered.contains("Market summary"), "{rendered:?}");
@@ -4117,7 +4117,7 @@ mod tests {
             result: Ok(Box::new(detail)),
         });
 
-        let rendered = text_at(&app, 200, 30);
+        let rendered = text_at(&app, 280, 30);
         assert!(rendered.contains(" Coin data "), "{rendered:?}");
         assert!(rendered.contains("ATH: $100K (-50.00%)"), "{rendered:?}");
         assert!(rendered.contains("FDV: $1.1T"), "{rendered:?}");
@@ -4141,7 +4141,7 @@ mod tests {
             -2.0,
             vec![1.0, 2.0],
         )]);
-        let rendered = text_at(&basic, 200, 30);
+        let rendered = text_at(&basic, 280, 30);
         assert!(
             rendered.contains("Loading extended data..."),
             "{rendered:?}"

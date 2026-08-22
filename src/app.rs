@@ -3443,7 +3443,7 @@ mod tests {
             ),
             "a completed detail fetch upgrades the pane to Ready"
         );
-        let rendered = render_text_at(&app, 200, 30);
+        let rendered = render_text_at(&app, 280, 30);
         assert!(
             rendered.contains("ATH: $100K") && rendered.contains("Categories: layer-1"),
             "the rich detail fields render: {rendered:?}"
