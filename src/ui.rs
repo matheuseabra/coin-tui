@@ -258,7 +258,10 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
     let inner_width = area.width.saturating_sub(2);
     let projection = view::news(app.news_feed(), app.news_enabled());
     let mut lines = Vec::new();
-    for item in &projection.items {
+    for (index, item) in projection.items.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::default());
+        }
         lines.push(headline_line(item, theme));
     }
     if projection.items.is_empty() {
@@ -501,7 +504,7 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
         return;
     }
     if inner.width >= DETAIL_SIDEBAR_MIN_WIDTH {
-        let sidebar_width = DETAIL_SIDEBAR_WIDTH.min(inner.width * 2 / 5).max(30);
+        let sidebar_width = (inner.width * 30 / 100).max(DETAIL_SIDEBAR_WIDTH);
         let [sidebar, main] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
@@ -3889,7 +3892,7 @@ mod tests {
         )));
         let later = text_at(&app, 60, 16);
         assert!(app.news_scroll() > 0);
-        assert!(later.contains("Headline 19 about markets"), "{later:?}");
+        assert!(later.contains("Headline 8 about markets"), "{later:?}");
     }
 
     #[test]
