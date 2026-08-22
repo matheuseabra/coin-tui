@@ -3313,8 +3313,10 @@ mod tests {
         assert_eq!(app.detail_range(), ChartRange::Month);
         assert!(is_render(app.update(Event::Input(key('[')))));
         assert_eq!(app.detail_range(), ChartRange::Week);
+        assert!(is_render(app.update(Event::Input(key('/')))));
+        assert_eq!(app.detail_range(), ChartRange::Month);
         let selected = app.selected();
-        for route in ['j', 'k', 'g', 'G', 's', 'S', '/'] {
+        for route in ['j', 'k', 'g', 'G', 's', 'S'] {
             assert!(
                 matches!(app.update(Event::Input(key(route))), Command::None),
                 "{route} is swallowed while detail is open"

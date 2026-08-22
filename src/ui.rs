@@ -259,7 +259,7 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
     let projection = view::news(app.news_feed(), app.news_enabled());
     let mut lines = Vec::new();
     for item in &projection.items {
-        lines.extend(headline_lines(item, theme));
+        lines.push(headline_line(item, theme));
     }
     if projection.items.is_empty() {
         lines.push(Line::styled(
@@ -296,22 +296,22 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
     );
 }
 
-/// One headline keeps the title first so the primary information survives a
-/// narrow pane. Time and category follow on a separate metadata line.
-fn headline_lines(item: &NewsItem, theme: &Theme) -> Vec<Line<'static>> {
+/// One headline keeps title, time, and category on one wrapped line so the
+/// metadata stays attached to the story it describes.
+fn headline_line(item: &NewsItem, theme: &Theme) -> Line<'static> {
     let title = clean_remote(item.title(), 220);
     let category = clean_remote(item.category(), 32);
     let age = item
         .published_at()
         .and_then(|at| (Utc::now() - at).to_std().ok());
     let age = age.map_or_else(|| "-".to_owned(), format_age);
-    vec![
-        Line::styled(title, Style::default()),
-        Line::styled(
-            format!("  · {age} · {category}"),
+    Line::from(vec![
+        Span::styled(title, Style::default()),
+        Span::styled(
+            format!(" · {age} · {category}"),
             Style::default().fg(theme.summary),
         ),
-    ]
+    ])
 }
 
 /// Shared pane frame; the focused pane's title is emphasized.
@@ -354,7 +354,7 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
             Style::default().fg(theme.notice),
         )];
     };
-    let mut lines = Vec::with_capacity(6);
+    let mut lines = Vec::with_capacity(12);
     lines.push(Line::styled(
         "24h breadth",
         Style::default()
@@ -365,6 +365,7 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
         "↑ Up {}   ↓ Down {}   • Flat {}",
         projection.up, projection.down, projection.flat
     )));
+    lines.push(Line::default());
     let meter_prefix = "Bullish ";
     let meter_suffix = format!(" {}%", projection.bullish);
     let bar_cells = width
@@ -378,16 +379,31 @@ fn sentiment_lines(app: &App, width: usize, theme: &Theme) -> Vec<Line<'static>>
         meter_suffix,
     );
     lines.push(Line::styled(meter, Style::default().fg(theme.gain)));
+    lines.push(Line::default());
     lines.push(Line::from(format!(
         "Avg 24h: {}",
         format_percentage(Some(projection.average))
     )));
     if let Some(index) = app.fear_greed() {
-        lines.push(Line::from(format!(
-            "Fear & Greed: {} ({})",
-            index.value, index.classification
-        )));
+        let prefix = "Fear & Greed ";
+        let suffix = format!("  {} {}", index.value, index.classification);
+        let cells = width.saturating_sub(prefix.len() + suffix.len()).max(1);
+        let filled = cells * usize::from(index.value) / 100;
+        let gauge = format!(
+            "{prefix}{}{}{suffix}",
+            "█".repeat(filled),
+            "░".repeat(cells - filled)
+        );
+        let style = if index.value < 40 {
+            Style::default().fg(theme.loss)
+        } else if index.value > 60 {
+            Style::default().fg(theme.gain)
+        } else {
+            Style::default().fg(theme.notice)
+        };
+        lines.push(Line::styled(gauge, style));
     }
+    lines.push(Line::default());
     if let Some((symbol, value)) = projection.best {
         lines.push(Line::from(format!(
             "↗ Best: {} {}",
@@ -486,12 +502,12 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
     }
     if inner.width >= DETAIL_SIDEBAR_MIN_WIDTH {
         let sidebar_width = DETAIL_SIDEBAR_WIDTH.min(inner.width * 2 / 5).max(30);
-        let [main, sidebar] = Layout::default()
+        let [sidebar, main] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
             .areas(inner);
-        render_detail_main(frame, state, main, theme, true, app.detail_range());
         render_detail_sidebar(frame, app, state, sidebar, theme);
+        render_detail_main(frame, state, main, theme, true, app.detail_range());
     } else {
         render_detail_main(frame, state, inner, theme, false, app.detail_range());
     }
@@ -722,7 +738,7 @@ fn render_detail_sidebar(
     area: ratatui::layout::Rect,
     theme: &Theme,
 ) {
-    let block = Block::default().borders(Borders::LEFT).title(Line::styled(
+    let block = Block::default().borders(Borders::RIGHT).title(Line::styled(
         " Coin data ",
         Style::default().fg(theme.summary),
     ));
@@ -767,7 +783,7 @@ fn render_detail_sidebar(
 fn detail_stat_rows(state: &DetailState) -> Vec<(&'static str, String)> {
     match state {
         DetailState::Ready { detail, .. } => {
-            let mut rows = vec![
+            let rows = vec![
                 ("Mkt cap", format_compact_money(detail.market_cap())),
                 ("Vol 24h", format_compact_money(detail.volume_24h())),
                 ("24h high", format_price(detail.high_24h())),
@@ -810,9 +826,6 @@ fn detail_stat_rows(state: &DetailState) -> Vec<(&'static str, String)> {
                         .join(", "),
                 ),
             ];
-            if let Some(description) = detail.description() {
-                rows.push(("About", clean_remote(description, 120)));
-            }
             rows
         }
         DetailState::Basic(coin) | DetailState::Loading { base: coin, .. } => vec![
@@ -3876,7 +3889,7 @@ mod tests {
         )));
         let later = text_at(&app, 60, 16);
         assert!(app.news_scroll() > 0);
-        assert!(later.contains("Headline 8 about markets"), "{later:?}");
+        assert!(later.contains("Headline 19 about markets"), "{later:?}");
     }
 
     #[test]
@@ -3959,7 +3972,7 @@ mod tests {
         assert!(rendered.contains("↘ Worst: BB -1.00%"), "{rendered:?}");
         assert!(rendered.contains("Avg 24h:"), "{rendered:?}");
         assert!(
-            rendered.contains("Fear & Greed: 72 (Greed)"),
+            rendered.contains("Fear & Greed") && rendered.contains("72 Greed"),
             "{rendered:?}"
         );
     }
