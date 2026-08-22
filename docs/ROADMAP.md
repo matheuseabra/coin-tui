@@ -216,6 +216,8 @@ the `PRODUCT.md` layout guarantees.
 
 Quality gate `G6`:
 
+- Follow-up evidence: news and sentiment panes now use one-cell horizontal padding, and wide coin detail uses an exact 30% left sidebar / 70% main-area split. `cargo fmt`, Clippy with denied warnings, and the full 153-test unit suite plus 52 provider tests pass.
+
 - [ ] All M6 tasks are accepted.
 - [ ] The baseline checks in `docs/TESTING.md` pass with the new screens and feeds.
 - [ ] Manual checks confirm each new surface at compact, standard, and full widths, readable without color.

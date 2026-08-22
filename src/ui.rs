@@ -3,7 +3,9 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{
+        Block, Borders, Cell, HighlightSpacing, Padding, Paragraph, Row, Table, TableState, Wrap,
+    },
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -35,9 +37,6 @@ const PANE_MIN_WIDTH: u16 = 162;
 /// Detail sidebar (coin data) appears beside the chart when the pane is at
 /// least this wide; below it the stats render as stacked lines under chart.
 const DETAIL_SIDEBAR_MIN_WIDTH: u16 = 78;
-
-/// Detail sidebar width at standard and full widths.
-const DETAIL_SIDEBAR_WIDTH: u16 = 36;
 
 /// Help overlay width and content. Every line must fit the inner width (width
 /// minus borders) and the whole block must fit the minimum supported height.
@@ -255,7 +254,7 @@ fn render_market(
 /// disabled, still loading, failed, or empty.
 fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
     let theme = app.theme();
-    let inner_width = area.width.saturating_sub(2);
+    let inner_width = area.width.saturating_sub(4);
     let projection = view::news(app.news_feed(), app.news_enabled());
     let mut lines = Vec::new();
     for (index, item) in projection.items.iter().enumerate() {
@@ -294,7 +293,7 @@ fn news_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focu
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .block(pane_block("News", focused, theme)),
+            .block(pane_block("News", focused, theme).padding(Padding::horizontal(1))),
         area,
     );
 }
@@ -336,10 +335,11 @@ fn pane_block(title: &str, focused: bool, theme: &Theme) -> Block<'static> {
 /// bullish share meter, and the average, best, and worst mover.
 fn sentiment_pane(app: &App, frame: &mut Frame<'_>, area: ratatui::layout::Rect, focused: bool) {
     let theme = app.theme();
-    let inner_width = area.width.saturating_sub(2) as usize;
+    let inner_width = area.width.saturating_sub(4) as usize;
     let lines = sentiment_lines(app, inner_width, theme);
     frame.render_widget(
-        Paragraph::new(lines).block(pane_block("Sentiment", focused, theme)),
+        Paragraph::new(lines)
+            .block(pane_block("Sentiment", focused, theme).padding(Padding::horizontal(1))),
         area,
     );
 }
@@ -483,8 +483,9 @@ fn table_frame(
 /// Read-only coin detail pane in a CoinMarketCap shape: a scaled-down content
 /// column holds the identity header (rank, name, symbol), the price with its
 /// 24-hour change, the 1h/24h/7d change strip, and a fixed-geometry gradient
-/// area chart with real price labels. Wide panes add a right-hand "coin data"
-/// column fed by the rich `/coins/{id}` detail when it has loaded; narrow
+/// area chart with real price labels. Wide panes add a left-hand "coin data"
+/// column at exactly 30% of the available width, fed by the rich `/coins/{id}`
+/// detail when it has loaded; narrow
 /// panes stack a two-line market-stats grid under the chart instead. It always
 /// renders from the snapshot row's own normalized series as a fallback, so it
 /// works offline against the fixture server.
@@ -504,7 +505,7 @@ fn render_detail(frame: &mut Frame<'_>, app: &App, area: ratatui::layout::Rect, 
         return;
     }
     if inner.width >= DETAIL_SIDEBAR_MIN_WIDTH {
-        let sidebar_width = (inner.width * 30 / 100).max(DETAIL_SIDEBAR_WIDTH);
+        let sidebar_width = (inner.width * 30 / 100).max(1);
         let [sidebar, main] = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(sidebar_width)])
